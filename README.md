@@ -3,7 +3,8 @@ resulting Open Access Publication records, and push into the Symplectic Elements
 
 Test usage:
 
-``./setup.sh
-bundle exec ruby groupOapPubs.rb eschol_auth_title.dump | more``
+``./setup.sh``
+
+``bundle exec ruby groupOapPubs.rb eschol_auth_title.dump | more``
 
 (takes a minute or two to run, prints out diagnostic info and then the dupes found)
