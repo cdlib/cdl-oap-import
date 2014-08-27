@@ -1,2 +1,6 @@
-*.txt
+bin
+gems
 *.dump
+Gemfile.lock
+out
+cache/*.cache

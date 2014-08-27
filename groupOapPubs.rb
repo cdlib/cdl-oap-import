@@ -7,8 +7,10 @@
 # The code is very much a work in progress.
 
 # System libraries
+require 'fileutils'
 require 'ostruct'
 require 'set'
+require 'zlib'
 
 # Flush stdout after each write
 STDOUT.sync = true
@@ -179,24 +181,40 @@ def groupItems()
   }
 end
 
+def readItems(filename)
+  FileUtils::mkdir_p('cache')
+  cacheFile = "cache/#{filename}.cache"
+  if File.exists? cacheFile
+    Zlib::GzipReader.open(cacheFile) { |io| $idToItem = Marshal.load(io) }
+  else
+    File.open(filename, "r:UTF-8").each { |line|
+      id, title, authors, contentExists, withdrawn, entity, date = line.split("|")
+      next if withdrawn != ""
+      next if contentExists != "yes"
+
+      ftitle = filterTitle(title)
+      fauthors = filterAuthors(authors)
+      docKey = ftitle.join(' ')
+      item = Item.new(id, title, authors, entity, date, docKey, ftitle, fauthors)
+      $idToItem[id] = item
+    }
+
+    Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump($idToItem, io) }
+  end
+end
+
 ###################################################################################################
 # Top-level driver
 def main
 
   # Read the primary data, parse it, and build our hashes
   puts "Reading items."
-  File.open(ARGV[0], "r:UTF-8").each { |line|
-    id, title, authors, contentExists, withdrawn, entity, date = line.split("|")
-    next if withdrawn != ""
-    next if contentExists != "yes"
+  readItems(ARGV[0])
 
-    ftitle = filterTitle(title)
-    fauthors = filterAuthors(authors)
-    docKey = ftitle.join(' ')
-    item = Item.new(id, title, authors, entity, date, docKey, ftitle, fauthors)
-    $idToItem[id] = item
-    $titleCount[title] += 1
-    $docKeyToIds[docKey] << id
+  puts "Distributing items."
+  $idToItem.each { |id, item|
+    $titleCount[item.title] += 1
+    $docKeyToIds[item.docKey] << id
   }
 
   # Print out things we're treating as series titles
