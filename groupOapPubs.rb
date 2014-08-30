@@ -8,6 +8,7 @@
 
 # System libraries
 require 'fileutils'
+require 'nokogiri'
 require 'ostruct'
 require 'set'
 require 'zlib'
@@ -16,9 +17,10 @@ require 'zlib'
 STDOUT.sync = true
 
 # Global variables
-$idToItem = {}
-$docKeyToIds = Hash.new{|h, k| h[k] = Set.new }
+$allItems = []
+$docKeyToItems = Hash.new{|h, k| h[k] = Array.new }
 $titleCount = Hash.new{|h, k| h[k] = 0 }
+$authKeys = Hash.new{|h, k| h[k] = calcAuthorKeys(k) }
 $pubs = []
 
 # Common English stop-words
@@ -26,10 +28,10 @@ $stopwords = Set.new(("a an the of and to in that was his he it with is for as h
                       "from this him but all she they were my are me one their so an said them we who would been will no when").split)
 
 # Structure for holding information on an item
-Item = Struct.new(:id, :title, :authors, :entity, :date, :docKey, :ftitle, :fauthors)
+Item = Struct.new(:title, :docKey, :authors, :date, :ids, :journal, :volume, :issue)
 
 # Structure for holding a group of duplicate items
-OAPub = Struct.new(:itemIds)
+OAPub = Struct.new(:items)
 
 # We need to identify recurring series items and avoid grouping them. Best way seems to be just by title.
 seriesTitles = [
@@ -87,6 +89,14 @@ $transTo   = "AAAAAAaaaaaaAaAaAaCcCcCcCcCcDdDdDdEEEEeeeeEeEeEeEeEeGgGgGgGgHhHhII
              "lLlLlNnNnNnNnnNnOOOOOOooooooOoOoOoRrRrRrSsSsSsSssTtTtTtUUUUuuuuUuUuUuUuUuUuWwYyyYyYZzZzZz"
 
 ###################################################################################################
+# Monkey patches to make Nokogiri even more elegant
+class Nokogiri::XML::Node
+  def text_at(xpath)
+    at(xpath) ? at(xpath).text : nil
+  end
+end
+
+###################################################################################################
 # Remove accents from a string
 def transliterate(str)
   str.tr($transFrom, $transTo)
@@ -95,9 +105,11 @@ end
 ###################################################################################################
 # Convert to lower case, remove HTML-like elements, strip out weird characters, normalize spaces.
 def normalize(str)
+  str or return ''
   tmp = transliterate(str)
-  tmp = tmp.downcase.gsub(/&lt[;,]/, '<').gsub(/&gt[;,]/, '>').gsub(/&#?\w+[;,]/, '')
-  tmp = tmp.gsub(/<[^>]+>/, ' ').gsub(/\\n/, ' ').gsub(/[^a-z0-9 ]/, '')
+  tmp = tmp.gsub(/&lt[;,]/, '<').gsub(/&gt[;,]/, '>').gsub(/&#?\w+[;,]/, '')
+  tmp = tmp.gsub(/<[^>]+>/, ' ').gsub(/\\n/, ' ')
+  tmp = tmp.gsub(/[|]/, '')
   tmp = tmp.gsub(/\s\s+/,' ').strip
   return tmp
 end
@@ -106,7 +118,7 @@ end
 # Title-specific normalization
 def filterTitle(title)
   # Break it into words, and remove the stop words.
-  normalize(title).split.select { |w| !$stopwords.include?(w) }
+  normalize(title).downcase.gsub(/[^a-z0-9 ]/, '').split.select { |w| !$stopwords.include?(w) }
 end
 
 ###################################################################################################
@@ -118,15 +130,23 @@ def filterAuthors(authors)
 
     # Attempt to get the last name first.
     if author =~ /^([^,]+?) (\w+)$/
+      puts "Swap author: #{author}"
       author = normalize($2 + " " + $1)
     else
       author = normalize(author)
     end
 
     # Take the first 4 alpha characters of the result
-    author.gsub(/[^a-z]/,'')[0,4]
+    author.downcase.gsub(/[^a-z]/,'')[0,4]
   }.sort() # Put authors in sorted order for easier matching
 end
+
+###################################################################################################
+def calcAuthorKeys(item)
+  Set.new(item.authors.map { |auth|
+    normalize(auth).downcase.gsub(/[^a-z]/,'')[0,4]
+  })
+end  
 
 ###################################################################################################
 # Determine if the title is a likely series item
@@ -137,16 +157,109 @@ def isSeriesTitle(title)
 end
 
 ###################################################################################################
+# See if the candidate is compatible with the existing items in the group
+def isCompatible(items, cand)
+  candAuthKeys = $authKeys[cand]
+  return true if candAuthKeys.empty?
+  ok = true
+  items.each { |item|
+    itemAuthKeys = $authKeys[item]
+    next if itemAuthKeys.empty?
+    overlap = itemAuthKeys & candAuthKeys
+    #overlap.empty? and puts "No overlap: #{itemAuthKeys.to_a.join(',')} vs. #{candAuthKeys.to_a.join(',')}"
+    overlap.empty? and ok = false
+  }
+  return ok
+end
+
+###################################################################################################
+def readItems(filename)
+  FileUtils::mkdir_p('cache')
+  cacheFile = "cache/#{filename}.cache"
+  if File.exists?(cacheFile) && File.mtime(cacheFile) > File.mtime(filename)
+    puts "Reading cache for #{filename}."
+    Zlib::GzipReader.open(cacheFile) { |io| return Marshal.load(io) }
+  else
+    items = []
+    puts "Reading #{filename}."
+    doc = Nokogiri::XML(filename =~ /\.gz$/ ? Zlib::GzipReader.open(filename) : File.open(filename), &:noblanks)
+    puts "Parsing."
+    doc.remove_namespaces!
+    nParsed = 0
+    doc.xpath('records/*').each { |record|
+      record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
+      native = record.at('native')
+
+      # Title parsing and doc key generation
+      title = normalize(native.text_at("field[@name='title']"))
+      docKey = filterTitle(title).join(' ')
+
+      # Author parsing
+      authors = native.xpath("field[@name='authors']/people/person").map { |person|
+        lname = normalize(person.text_at('last-name'))
+        initials = normalize(person.text_at('initials'))
+        email = normalize(person.text_at('email'))
+        "#{lname}, #{initials}|#{email}"
+      }
+      
+      # Date parsing
+      dateField = native.at("field[@name='publication-date']/date")
+      if dateField
+        year = dateField.at("year") ? dateField.at("year").text : '0'
+        month = dateField.at("month") ? dateField.at("month").text : '0'
+        day = dateField.at("day") ? dateField.at("day").text : '0'
+        date = "#{year.rjust(4,'0')}-#{month.rjust(2,'0')}-#{day.rjust(2,'0')}"
+      else
+        date = nil
+      end
+
+      # Identifier parsing
+      ids = native.xpath("field[@name='external-identifiers']/identifiers/identifier").map { |ident|
+        [ident['scheme'], ident.text]
+      }
+
+      # Journal/vol/iss
+      journal = native.text_at("field[@name='journal']")
+      volume  = native.text_at("field[@name='volume']")
+      issue   = native.text_at("field[@name='issue']")
+
+      # Bundle up the result
+      item = Item.new(title, docKey, authors, date, ids, journal, volume, issue)
+      items << item
+      #puts item
+
+      # Give feedback every once in a while.
+      nParsed += 1
+      if (nParsed % 1000) == 0
+        puts "...#{nParsed} parsed."
+      end
+    }
+
+    puts "Writing cache file."
+    Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump(items, io) }
+    return items
+  end
+end
+
+###################################################################################################
+def addItems(items)
+  $allItems += items
+  items.each { |item|
+    $titleCount[item.title] += 1
+    $docKeyToItems[item.docKey] << item
+  }
+end
+
+###################################################################################################
 # For items with a matching title key, group together by overlapping authors to form the OA Pubs.
 def groupItems()
-  $docKeyToIds.sort.each { |docKey, ids|
-    items = ids.map { |id| $idToItem[id] }
+  $docKeyToItems.sort.each { |docKey, items|
 
     # If there are 5 or more dates involved, this is probably a series thing.
     numDates = items.map{ |info| info.date }.uniq.length
 
     # Singleton cases.
-    if ids.length == 1 || numDates >= 5 || isSeriesTitle(items[0].title)
+    if items.length == 1 || numDates >= 5 || isSeriesTitle(items[0].title)
       if numDates >= 5
         if !isSeriesTitle(items[0].title)
           puts "Probable series (#{numDates} dates): #{items[0].title}"
@@ -156,24 +269,43 @@ def groupItems()
       end
       
       # Singletons: make a separate OAPub for each item
-      ids.each { |id| $pubs << OAPub.new([id]) }
+      items.each { |item| $pubs << OAPub.new([item]) }
       next
     end
 
-    # We know the docs all share the same title key. Group those that share an author.
+    # We know the docs all share the same title key. Group those that have compatible authors,
+    # ids, etc.
     while !items.empty?
 
       # Get the first item
       item1 = items.shift
-      pub = OAPub.new([item1.id])
+      pub = OAPub.new([item1])
 
-      # Match it up to every other item that shares at least one author key
+      # Match it up to every other item that's compatible
       items.dup.each { |item2|
-        if item1.authors == item2.authors || (item1.fauthors & item2.fauthors).length > 0
+        if isCompatible(pub.items, item2)
           items.delete(item2)
-          pub.itemIds << item2.id
+          pub.items << item2
         end
       }
+
+      # See all the kinds of ids we got
+      idKinds = Set.new
+      pub.items.each { |item|
+        item.ids.each { |kind, id|
+          idKinds << kind.gsub(/^(uci|ucla|ucsf)_id/, 'campus_id')
+        }
+      }
+
+      if pub.items.length > 1 && idKinds.include?('eschol_id') && idKinds.include?('campus_id')
+        puts
+        pub.items.each { |item|
+          idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
+          puts "#{item.title}"
+          puts "    #{item.date}     #{item.authors.join(', ')}"
+          puts "    #{idStr}"
+        }
+      end
 
       # Done with this grouped publication
       $pubs << pub
@@ -181,40 +313,14 @@ def groupItems()
   }
 end
 
-def readItems(filename)
-  FileUtils::mkdir_p('cache')
-  cacheFile = "cache/#{filename}.cache"
-  if File.exists? cacheFile
-    Zlib::GzipReader.open(cacheFile) { |io| $idToItem = Marshal.load(io) }
-  else
-    File.open(filename, "r:UTF-8").each { |line|
-      id, title, authors, contentExists, withdrawn, entity, date = line.split("|")
-      next if withdrawn != ""
-      next if contentExists != "yes"
-
-      ftitle = filterTitle(title)
-      fauthors = filterAuthors(authors)
-      docKey = ftitle.join(' ')
-      item = Item.new(id, title, authors, entity, date, docKey, ftitle, fauthors)
-      $idToItem[id] = item
-    }
-
-    Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump($idToItem, io) }
-  end
-end
-
 ###################################################################################################
 # Top-level driver
 def main
 
   # Read the primary data, parse it, and build our hashes
-  puts "Reading items."
-  readItems(ARGV[0])
-
-  puts "Distributing items."
-  $idToItem.each { |id, item|
-    $titleCount[item.title] += 1
-    $docKeyToIds[item.docKey] << id
+  puts "Reading and adding items."
+  ARGV.each { |filename|
+    addItems(readItems(filename))
   }
 
   # Print out things we're treating as series titles
@@ -238,16 +344,15 @@ def main
   groupItems()
 
   # Print the interesting (i.e. non-singleton) groups
-  $pubs.each { |pub|
-    if pub.itemIds.length > 1
-      puts
-      pub.itemIds.each_with_index { |id, index|
-        item = $idToItem[id]
-        puts "#{id}  #{item.title}"
-        puts "    #{item.date}     #{item.entity.ljust(20)}     #{item.authors}"
-      }
-    end
-  }
+  #$pubs.each { |pub|
+  #  if pub.items.length > 1
+  #    puts
+  #    pub.items.each { |item|
+  #      puts "#{item.ids}  #{item.title}"
+  #      puts "    #{item.date}     #{item.authors}"
+  #    }
+  #  end
+  #}
 end
 
 main()
