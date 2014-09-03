@@ -151,6 +151,11 @@ def isSeriesTitle(title)
 end
 
 ###################################################################################################
+def isCampusID(scheme)
+  return scheme =~ /^(eschol|uc\w+)_id/
+end
+
+###################################################################################################
 # See if the candidate is compatible with the existing items in the group
 def isCompatible(items, cand)
   candAuthKeys = $authKeys[cand]
@@ -174,7 +179,7 @@ def isCompatible(items, cand)
 
   # Make sure the candidate has no conflicting IDs
   cand.ids.each { |scheme, text|
-    next if scheme =~ /^(eschol|uc\w+)_id/   # we know that campus IDs overlap, and that's expected
+    next if isCampusID(scheme)   # we know that campus IDs overlap each other, and that's expected
     if ids.include?(scheme) && ids[scheme] != text
       puts "ID mismatch for scheme #{scheme.inspect}: #{text.inspect} vs #{ids[scheme].inspect}"
       ok = false
@@ -194,11 +199,14 @@ def readItems(filename)
     Zlib::GzipReader.open(cacheFile) { |io| return Marshal.load(io) }
   else
     items = []
+    campusIds = Set.new
     puts "Reading #{filename}."
     doc = Nokogiri::XML(filename =~ /\.gz$/ ? Zlib::GzipReader.open(filename) : File.open(filename), &:noblanks)
     puts "Parsing."
     doc.remove_namespaces!
     nParsed = 0
+    nDupes = 0
+    nTotal = doc.xpath('records/*').length
     doc.xpath('records/*').each { |record|
       record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
       native = record.at('native')
@@ -227,8 +235,15 @@ def readItems(filename)
       end
 
       # Identifier parsing
+      dupeCampusID = false
       ids = native.xpath("field[@name='external-identifiers']/identifiers/identifier").map { |ident|
-        [ident['scheme'].downcase.strip, normalizeIdentifier(ident.text)]
+        scheme = ident['scheme'].downcase.strip
+        text = normalizeIdentifier(ident.text)
+        if isCampusID(scheme)
+          campusIds.include?(text) and dupeCampusID = "#{scheme}::#{text}"
+          campusIds << text
+        end
+        [scheme, text]
       }
 
       # Journal/vol/iss
@@ -237,16 +252,23 @@ def readItems(filename)
       issue   = native.text_at("field[@name='issue']")
 
       # Bundle up the result
-      item = Item.new(title, docKey, authors, date, ids, journal, volume, issue)
-      items << item
-      #puts item
+      if dupeCampusID
+        #puts "Skipping dupe record for campus id #{dupeCampusID}."
+        nDupes += 1
+        next
+      else
+        item = Item.new(title, docKey, authors, date, ids, journal, volume, issue)
+        items << item
+        #puts item
+      end
 
       # Give feedback every once in a while.
       nParsed += 1
       if (nParsed % 1000) == 0
-        puts "...#{nParsed} parsed."
-      end
+        puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
+      end      
     }
+    puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
 
     puts "Writing cache file."
     Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump(items, io) }
