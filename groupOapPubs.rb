@@ -7,7 +7,10 @@
 # The code is very much a work in progress.
 
 # System libraries
+require 'date'
+require 'ezid'
 require 'fileutils'
+require 'netrc'
 require 'nokogiri'
 require 'ostruct'
 require 'set'
@@ -22,6 +25,8 @@ $docKeyToItems = Hash.new{|h, k| h[k] = Array.new }
 $titleCount = Hash.new{|h, k| h[k] = 0 }
 $authKeys = Hash.new{|h, k| h[k] = calcAuthorKeys(k) }
 $pubs = []
+$allUserEmails = nil
+$credentials = nil
 
 # Common English stop-words
 $stopwords = Set.new(("a an the of and to in that was his he it with is for as had you not be her on at by which have or " +
@@ -31,7 +36,7 @@ $stopwords = Set.new(("a an the of and to in that was his he it with is for as h
 Item = Struct.new(:title, :docKey, :authors, :date, :ids, :journal, :volume, :issue)
 
 # Structure for holding a group of duplicate items
-OAPub = Struct.new(:items)
+OAPub = Struct.new(:items, :userEmails)
 
 # We need to identify recurring series items and avoid grouping them. Best way seems to be just by title.
 seriesTitles = [
@@ -115,30 +120,19 @@ def normalize(str)
 end
 
 ###################################################################################################
+# Special normalization for identifiers
+def normalizeIdentifier(str)
+  str or return ''
+  tmp = str.downcase.strip
+  tmp = tmp.sub(/^https?:\/\/dx.doi.org\//, '').sub(/^(doi(\.org)?|pmid|pmcid):/, '').sub(/\.+$/, '')
+  return tmp
+end
+
+###################################################################################################
 # Title-specific normalization
 def filterTitle(title)
   # Break it into words, and remove the stop words.
   normalize(title).downcase.gsub(/[^a-z0-9 ]/, '').split.select { |w| !$stopwords.include?(w) }
-end
-
-###################################################################################################
-# Author-specific normalization
-def filterAuthors(authors)
-
-  # The individual authors are delimited by semicolons
-  authors.split(";").map { |author|
-
-    # Attempt to get the last name first.
-    if author =~ /^([^,]+?) (\w+)$/
-      puts "Swap author: #{author}"
-      author = normalize($2 + " " + $1)
-    else
-      author = normalize(author)
-    end
-
-    # Take the first 4 alpha characters of the result
-    author.downcase.gsub(/[^a-z]/,'')[0,4]
-  }.sort() # Put authors in sorted order for easier matching
 end
 
 ###################################################################################################
@@ -162,13 +156,32 @@ def isCompatible(items, cand)
   candAuthKeys = $authKeys[cand]
   return true if candAuthKeys.empty?
   ok = true
+  ids = {}
+
+  # Make sure the candidate overlaps at least one author of every pub in the set
   items.each { |item|
     itemAuthKeys = $authKeys[item]
     next if itemAuthKeys.empty?
     overlap = itemAuthKeys & candAuthKeys
-    #overlap.empty? and puts "No overlap: #{itemAuthKeys.to_a.join(',')} vs. #{candAuthKeys.to_a.join(',')}"
-    overlap.empty? and ok = false
+    if overlap.empty?
+      #puts "No overlap: #{itemAuthKeys.to_a.join(',')} vs. #{candAuthKeys.to_a.join(',')}"
+      ok = false
+    end
+    item.ids.each { |scheme, text|
+      ids[scheme] = text
+    }
   }
+
+  # Make sure the candidate has no conflicting IDs
+  cand.ids.each { |scheme, text|
+    next if scheme =~ /^(eschol|uc\w+)_id/   # we know that campus IDs overlap, and that's expected
+    if ids.include?(scheme) && ids[scheme] != text
+      puts "ID mismatch for scheme #{scheme.inspect}: #{text.inspect} vs #{ids[scheme].inspect}"
+      ok = false
+    end
+  }
+
+  # All done.
   return ok
 end
 
@@ -198,7 +211,7 @@ def readItems(filename)
       authors = native.xpath("field[@name='authors']/people/person").map { |person|
         lname = normalize(person.text_at('last-name'))
         initials = normalize(person.text_at('initials'))
-        email = normalize(person.text_at('email'))
+        email = normalize(person.text_at('email-address'))
         "#{lname}, #{initials}|#{email}"
       }
       
@@ -215,7 +228,7 @@ def readItems(filename)
 
       # Identifier parsing
       ids = native.xpath("field[@name='external-identifiers']/identifiers/identifier").map { |ident|
-        [ident['scheme'], ident.text]
+        [ident['scheme'].downcase.strip, normalizeIdentifier(ident.text)]
       }
 
       # Journal/vol/iss
@@ -262,9 +275,9 @@ def groupItems()
     if items.length == 1 || numDates >= 5 || isSeriesTitle(items[0].title)
       if numDates >= 5
         if !isSeriesTitle(items[0].title)
-          puts "Probable series (#{numDates} dates): #{items[0].title}"
+          #puts "Probable series (#{numDates} dates): #{items[0].title}"
         else
-          puts "Series would have been covered by date-count #{numDates}: #{items[0].title}"
+          #puts "Series would have been covered by date-count #{numDates}: #{items[0].title}"
         end
       end
       
@@ -289,23 +302,15 @@ def groupItems()
         end
       }
 
-      # See all the kinds of ids we got
-      idKinds = Set.new
+      # Match it up to Elements users
       pub.items.each { |item|
-        item.ids.each { |kind, id|
-          idKinds << kind.gsub(/^(uci|ucla|ucsf)_id/, 'campus_id')
+        item.authors.each { |author|
+          email = author.gsub(/.*\|/, '').downcase.strip
+          if $allUserEmails.include? email
+            (pub.userEmails ||= Set.new) << email
+          end
         }
       }
-
-      if pub.items.length > 1 && idKinds.include?('eschol_id') && idKinds.include?('campus_id')
-        puts
-        pub.items.each { |item|
-          idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-          puts "#{item.title}"
-          puts "    #{item.date}     #{item.authors.join(', ')}"
-          puts "    #{idStr}"
-        }
-      end
 
       # Done with this grouped publication
       $pubs << pub
@@ -314,12 +319,67 @@ def groupItems()
 end
 
 ###################################################################################################
+def readEmails(filename)
+  FileUtils::mkdir_p('cache')
+  cacheFile = "cache/#{filename}.cache"
+  if File.exists?(cacheFile) && File.mtime(cacheFile) > File.mtime(filename)
+    puts "Reading cache for #{filename}."
+    Zlib::GzipReader.open(cacheFile) { |io| return Marshal.load(io) }
+  else
+    emails = Set.new
+    puts "Reading #{filename}."
+    doc = Nokogiri::XML(filename =~ /\.gz$/ ? Zlib::GzipReader.open(filename) : File.open(filename), &:noblanks)
+    puts "Parsing."
+    doc.remove_namespaces!
+    doc.xpath('records/*').each { |record|
+      record.name == 'record' or raise("Unknown record type '#{record.name}'")
+      email = record.text_at("field[@name='[Email]']")
+      email or raise("Record missing email field: #{record}")
+      emails << email.downcase.strip
+
+      # Experiment: change foo@dept.ucla.edu to foo@ucla.edu
+      # Turns out this is a bad idea. There are different people with the same email in different
+      # departments. Example: amahajan@mednet.ucla.edu, amahajan@ucla.edu, amahajan@econ.ucla.edu
+      # are all different people.
+      #email2 = email.sub(/@.+\.(\w+\.\w+)$/, '@\\1')
+      #email2 != email and emails.include?(email2) and puts("Bad: dupe email #{email2}")
+      #email2 != email and emails << email2
+    }
+
+    puts "Writing cache file."
+    Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump(emails, io) }
+    return emails
+  end
+end
+
+###################################################################################################
+# Mint a new OAP identifier
+def mintOAPID(metadata)
+  resp = $ezidSession.mint(metadata)
+  resp.respond_to?(:errored?) and resp.errored? and raise("Error minting ark: #{resp.response}")
+  return resp.identifier
+end
+
+###################################################################################################
 # Top-level driver
 def main
 
+  # We'll need credentials for talking to EZID
+  (credentials = Netrc.read['ezid.cdlib.org']) or raise("No credentials for ezid.cdlib.org found in ~/.netrc")
+  puts "Starting EZID session."
+  $ezidSession = Ezid::ApiSession.new(credentials[0], credentials[1], :ark, '99999/fk4', 'https://ezid.cdlib.org')
+  #puts "Minting an ARK."
+  #puts mintOAPID({'erc.who' => 'eScholarship harvester',
+  #                'erc.what' => 'A test OAP identifier',
+  #                'erc.when' => DateTime.now.iso8601})
+
+  # Read in the email addresses of all Elements users
+  puts "Reading Elements email addresses."
+  $allUserEmails = readEmails(ARGV[0])
+
   # Read the primary data, parse it, and build our hashes
   puts "Reading and adding items."
-  ARGV.each { |filename|
+  ARGV[1..-1].each { |filename|
     addItems(readItems(filename))
   }
 
@@ -328,13 +388,13 @@ def main
   $titleCount.sort.each { |title, count|
     if isSeriesTitle(title)
       if count < cutoff
-        puts "Treating as series but #{count} is below cutoff: #{title}"
+        #puts "Treating as series but #{count} is below cutoff: #{title}"
       else
-        puts "Series title: #{title}"
+        #puts "Series title: #{title}"
       end
     else
       if count >= cutoff
-        puts "Not treating as series title but #{count} is above cutoff: #{title}"
+        #puts "Not treating as series title but #{count} is above cutoff: #{title}"
       end
     end
   }
@@ -343,16 +403,33 @@ def main
   puts "Grouping items."
   groupItems()
 
+  # Count the number that are associated with an Elements user
+  puts "Count of associated: #{$pubs.count { |pub| pub.userEmails }}"
+
   # Print the interesting (i.e. non-singleton) groups
-  #$pubs.each { |pub|
-  #  if pub.items.length > 1
-  #    puts
-  #    pub.items.each { |item|
-  #      puts "#{item.ids}  #{item.title}"
-  #      puts "    #{item.date}     #{item.authors}"
-  #    }
-  #  end
-  #}
+  $pubs.each { |pub|
+
+    # See all the kinds of ids we got
+    idKinds = Set.new
+    pub.items.each { |item|
+      item.ids.each { |scheme, id|
+        scheme.downcase!
+        idKinds << scheme
+        scheme =~ /^(uci|ucla|ucsf)_id/ and idKinds << 'campus_id'
+      }
+    }
+
+    if pub.items.length > 1 && idKinds.include?('eschol_id') && idKinds.include?('campus_id')
+      puts
+      puts "User emails: #{pub.userEmails.to_a.join(', ')}"
+      pub.items.each { |item|
+        idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
+        puts "#{item.title}"
+        puts "    #{item.date}     #{item.authors.join(', ')}"
+        puts "    #{idStr}"
+      }
+    end
+  }
 end
 
 main()
