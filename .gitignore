@@ -1,6 +1,7 @@
 bin
 gems
-*.dump
+oap.db
+*.xml
+*.xml.gz
 Gemfile.lock
-out
 cache/*.cache
