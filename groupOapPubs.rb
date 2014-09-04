@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 
-# This script groups publications together using title, author and (soon) other information like IDs.
+# This script groups publications together using title, author and identifiers.
 # The resulting de-duped "OA Publications" will be used for OAP identifier assignment and then pushing
 # into Symplectic Elements via the API.
 #

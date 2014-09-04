@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 
-bundle install --path=gems --binstubs
-if [ ! -e oap_ids.db ]; then
-  sqlite3 oap_ids.db < db_init.sql
+set -e
+if [ ! -e oap.db ]; then
+  echo "Initializing sqlite database."
+  rm -f oap.db.tmp
+  sqlite3 oap.db.tmp < db_init.sql
+  mv oap.db.tmp oap.db
 fi
+echo "Installing gems locally."
+bundle install --path=gems --binstubs
