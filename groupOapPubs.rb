@@ -4,6 +4,8 @@
 # The resulting de-duped "OA Publications" will be used for OAP identifier assignment and then pushing
 # into Symplectic Elements via the API.
 #
+# TODO: Associate these records, when we have an Elements ID, with the Elements item.
+#
 # The code is very much a work in progress.
 
 # System libraries
@@ -14,6 +16,7 @@ require 'netrc'
 require 'nokogiri'
 require 'ostruct'
 require 'set'
+require 'sqlite3'
 require 'zlib'
 
 # Flush stdout after each write
@@ -25,8 +28,9 @@ $docKeyToItems = Hash.new{|h, k| h[k] = Array.new }
 $titleCount = Hash.new{|h, k| h[k] = 0 }
 $authKeys = Hash.new{|h, k| h[k] = calcAuthorKeys(k) }
 $pubs = []
-$allUserEmails = nil
+$emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
 $credentials = nil
+$db = SQLite3::Database.new("oap.db")
 
 # Common English stop-words
 $stopwords = Set.new(("a an the of and to in that was his he it with is for as had you not be her on at by which have or " +
@@ -36,7 +40,7 @@ $stopwords = Set.new(("a an the of and to in that was his he it with is for as h
 Item = Struct.new(:title, :docKey, :authors, :date, :ids, :journal, :volume, :issue)
 
 # Structure for holding a group of duplicate items
-OAPub = Struct.new(:items, :userEmails)
+OAPub = Struct.new(:items, :userEmails, :userPropIds)
 
 # We need to identify recurring series items and avoid grouping them. Best way seems to be just by title.
 seriesTitles = [
@@ -152,7 +156,7 @@ end
 
 ###################################################################################################
 def isCampusID(scheme)
-  return scheme =~ /^(eschol|uc\w+)_id/
+  return scheme =~ /^c-/
 end
 
 ###################################################################################################
@@ -181,7 +185,7 @@ def isCompatible(items, cand)
   cand.ids.each { |scheme, text|
     next if isCampusID(scheme)   # we know that campus IDs overlap each other, and that's expected
     if ids.include?(scheme) && ids[scheme] != text
-      puts "ID mismatch for scheme #{scheme.inspect}: #{text.inspect} vs #{ids[scheme].inspect}"
+      #puts "ID mismatch for scheme #{scheme.inspect}: #{text.inspect} vs #{ids[scheme].inspect}"
       ok = false
     end
   }
@@ -212,7 +216,7 @@ def readItems(filename)
       native = record.at('native')
 
       # Title parsing and doc key generation
-      title = normalize(native.text_at("field[@name='title']"))
+      title = normalize(native.text_at("field[@name='title']/text"))
       docKey = filterTitle(title).join(' ')
 
       # Author parsing
@@ -236,20 +240,35 @@ def readItems(filename)
 
       # Identifier parsing
       dupeCampusID = false
-      ids = native.xpath("field[@name='external-identifiers']/identifiers/identifier").map { |ident|
+      gotCampusID = false
+      ids = []
+      ['eschol', 'ucla', 'uci', 'ucsf'].each { |campus|
+        tmp = native.text_at("field[@name='c-#{campus}-id']/text")
+        if tmp
+          tmp = normalizeIdentifier(tmp)
+          dupeCampusId ||= campusIds.include?(tmp)
+          campusIds << tmp
+          ids << ["c-#{campus}-id", tmp]
+          puts ["c-#{campus}-id", tmp]
+          gotCampusID = true
+        end
+      }
+      
+      gotCampusID or raise("No campus ID found: #{record}")
+
+      tmp = native.text_at("doi/text")
+      tmp and ids << ['doi', normalizeIdentifier(tmp)]
+
+      native.xpath("field[@name='external-identifiers']/identifiers/identifier").each { |ident|
         scheme = ident['scheme'].downcase.strip
         text = normalizeIdentifier(ident.text)
-        if isCampusID(scheme)
-          campusIds.include?(text) and dupeCampusID = "#{scheme}::#{text}"
-          campusIds << text
-        end
-        [scheme, text]
+        ids << [scheme, text]
       }
 
       # Journal/vol/iss
-      journal = native.text_at("field[@name='journal']")
-      volume  = native.text_at("field[@name='volume']")
-      issue   = native.text_at("field[@name='issue']")
+      journal = native.text_at("field[@name='journal']/text")
+      volume  = native.text_at("field[@name='volume']/text")
+      issue   = native.text_at("field[@name='issue']/text")
 
       # Bundle up the result
       if dupeCampusID
@@ -266,6 +285,8 @@ def readItems(filename)
       nParsed += 1
       if (nParsed % 1000) == 0
         puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
+        # TODO: For debugging speed, stop after 5000 records. For real production run, take this out!
+        break if nParsed == 5000
       end      
     }
     puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
@@ -283,6 +304,11 @@ def addItems(items)
     $titleCount[item.title] += 1
     $docKeyToItems[item.docKey] << item
   }
+end
+
+###################################################################################################
+def lookupElementsUser(email)
+  return $db.get_first_value("SELECT proprietary_id FROM emails WHERE email = ?", email)
 end
 
 ###################################################################################################
@@ -328,8 +354,10 @@ def groupItems()
       pub.items.each { |item|
         item.authors.each { |author|
           email = author.gsub(/.*\|/, '').downcase.strip
-          if $allUserEmails.include? email
+          propId = $emailToElementsUser[email]
+          if propId
             (pub.userEmails ||= Set.new) << email
+            (pub.userPropIds ||= Set.new) << propId
           end
         }
       }
@@ -338,40 +366,6 @@ def groupItems()
       $pubs << pub
     end
   }
-end
-
-###################################################################################################
-def readEmails(filename)
-  FileUtils::mkdir_p('cache')
-  cacheFile = "cache/#{filename}.cache"
-  if File.exists?(cacheFile) && File.mtime(cacheFile) > File.mtime(filename)
-    puts "Reading cache for #{filename}."
-    Zlib::GzipReader.open(cacheFile) { |io| return Marshal.load(io) }
-  else
-    emails = Set.new
-    puts "Reading #{filename}."
-    doc = Nokogiri::XML(filename =~ /\.gz$/ ? Zlib::GzipReader.open(filename) : File.open(filename), &:noblanks)
-    puts "Parsing."
-    doc.remove_namespaces!
-    doc.xpath('records/*').each { |record|
-      record.name == 'record' or raise("Unknown record type '#{record.name}'")
-      email = record.text_at("field[@name='[Email]']")
-      email or raise("Record missing email field: #{record}")
-      emails << email.downcase.strip
-
-      # Experiment: change foo@dept.ucla.edu to foo@ucla.edu
-      # Turns out this is a bad idea. There are different people with the same email in different
-      # departments. Example: amahajan@mednet.ucla.edu, amahajan@ucla.edu, amahajan@econ.ucla.edu
-      # are all different people.
-      #email2 = email.sub(/@.+\.(\w+\.\w+)$/, '@\\1')
-      #email2 != email and emails.include?(email2) and puts("Bad: dupe email #{email2}")
-      #email2 != email and emails << email2
-    }
-
-    puts "Writing cache file."
-    Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump(emails, io) }
-    return emails
-  end
 end
 
 ###################################################################################################
@@ -387,21 +381,17 @@ end
 def main
 
   # We'll need credentials for talking to EZID
-  (credentials = Netrc.read['ezid.cdlib.org']) or raise("No credentials for ezid.cdlib.org found in ~/.netrc")
+  (cred = Netrc.read['ezid.cdlib.org']) or raise("Need credentials for ezid.cdlib.org in ~/.netrc")
   puts "Starting EZID session."
-  $ezidSession = Ezid::ApiSession.new(credentials[0], credentials[1], :ark, '99999/fk4', 'https://ezid.cdlib.org')
+  $ezidSession = Ezid::ApiSession.new(cred[0], cred[1], :ark, '99999/fk4', 'https://ezid.cdlib.org')
   #puts "Minting an ARK."
   #puts mintOAPID({'erc.who' => 'eScholarship harvester',
   #                'erc.what' => 'A test OAP identifier',
   #                'erc.when' => DateTime.now.iso8601})
 
-  # Read in the email addresses of all Elements users
-  puts "Reading Elements email addresses."
-  $allUserEmails = readEmails(ARGV[0])
-
   # Read the primary data, parse it, and build our hashes
   puts "Reading and adding items."
-  ARGV[1..-1].each { |filename|
+  ARGV.each { |filename|
     addItems(readItems(filename))
   }
 
@@ -432,18 +422,19 @@ def main
   $pubs.each { |pub|
 
     # See all the kinds of ids we got
-    idKinds = Set.new
+    gotEschol = false
+    gotCampus = false
     pub.items.each { |item|
       item.ids.each { |scheme, id|
-        scheme.downcase!
-        idKinds << scheme
-        scheme =~ /^(uci|ucla|ucsf)_id/ and idKinds << 'campus_id'
+        gotEschol ||= (scheme == 'c-eschol-id')
+        gotCampus ||= (scheme =~ /^c-(uci|ucla|ucsf)-id/)
       }
     }
 
-    if pub.items.length > 1 && idKinds.include?('eschol_id') && idKinds.include?('campus_id')
+    if pub.items.length > 1 && gotEschol && gotCampus
       puts
       puts "User emails: #{pub.userEmails.to_a.join(', ')}"
+      puts "User ids   : #{pub.userPropIds.to_a.join(', ')}"
       pub.items.each { |item|
         idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
         puts "#{item.title}"
