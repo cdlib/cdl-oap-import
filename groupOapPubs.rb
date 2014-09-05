@@ -249,7 +249,6 @@ def readItems(filename)
           dupeCampusId ||= campusIds.include?(tmp)
           campusIds << tmp
           ids << ["c-#{campus}-id", tmp]
-          puts ["c-#{campus}-id", tmp]
           gotCampusID = true
         end
       }
@@ -377,6 +376,130 @@ def mintOAPID(metadata)
 end
 
 ###################################################################################################
+# Normalize both strings, and return the longer one.
+def longerOf(str1, str2)
+  return str1 if !str2
+  return str2 if !str1
+  str1 = normalize(str1)
+  str2 = normalize(str2)
+  return (str1.length >= str2.length) ? str1 : str2
+end
+
+###################################################################################################
+def isBetterItem(item1, item2)
+  def makeItemStr(item)
+    title = normalize(item.title)
+    date = item.date.gsub("-01", "-1").gsub("-00", "-")  # penalize less-exact dates
+    authors = item.authors.map { |auth| auth.split("|")[0] }.join(';')
+    str = "#{title}|#{date}|#{authors}|#{item.journal}|#{item.volume}|#{item.issue}"
+    puts str
+    return str
+  end
+  return makeItemStr(item1).length > makeItemStr(item2).length
+end
+
+###################################################################################################
+# Bring this grouped publication into Elements
+def importPub(pub)
+
+  # Pick the best item for its metadata
+  bestItem = pub.items.inject { |memo, item| isBetterItem(item, memo) ? item : memo }
+
+  ids = {}
+  pub.items.each { |item|
+    item.ids.each { |scheme, id|
+      ids[scheme] = longerOf(ids[scheme], id)
+    }
+  }
+
+  # For existing groups, we'll already have an identifier in the database.
+  oapID = nil
+  ids.each { |scheme, id|
+    if isCampusID(scheme)
+      oapID ||= $db.get_first_value("SELECT oap_id FROM ids WHERE campus_id = ?", "#{scheme}::#{id}")
+    end
+  }
+
+  # If we can't find one, mint a new one.
+  if not oapID
+    puts "Can't find OAP ID, minting a new one."
+    # Determine the EZID metadata
+    idStr = ids.to_a.map { |scheme, id| "#{scheme}::#{id}" }.join(' ')
+    meta = { 'erc.what' => "Grouped OA Publication record for '#{bestItem.title}' [IDs #{idStr}]",
+             'erc.who'  => bestItem.authors.map { |auth| auth.split("|")[0] }.join('; '),
+             'erc.when' => DateTime.now.iso8601 }
+    # And mint the ARK
+    oapID = mintOAPID(meta)
+  end
+  puts "OAP ID: #{oapID}"
+
+  # Associate this OAP identifier with all the item IDs so that in future this group will reliably
+  # receive the same identifier.
+  ids.each { |scheme, id|
+    if isCampusID(scheme)
+      $db.execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
+    end
+  }
+
+  # Form the XML that we will PUT into Elements
+  puts "best: #{bestItem}"
+  putData = Nokogiri::XML::Builder.new { |xml|
+    xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api") {
+      xml.native {
+        xml.field(name: 'title') { xml.text_ bestItem.title }
+        xml.field(name: 'authors') {
+          xml.people {
+            bestItem.authors.each { |auth|
+              xml.person {
+                name, email = auth.split("|")
+                last, initials = name.split(", ")
+                xml.send('last-name', last)
+                xml.initials(initials)
+                email and email.strip != '' and xml.send('email-address', email)
+              }
+            }
+          }
+        }
+        bestItem.journal and xml.field(name: 'journal') { xml.text_ bestItem.journal }
+        bestItem.volume and xml.field(name: 'volume') { xml.text_ bestItem.volume }
+        bestItem.issue and xml.field(name: 'issue') { xml.text_ bestItem.issue }
+        xml.field(name: 'publication-date') {
+          xml.date {
+            bestItem.date =~ /(\d\d\d\d)-0*(\d+)-0*(\d+)/
+            year, month, day = $1, $2, $3
+            year != 0 and xml.year year
+            month != '0' and xml.month month
+            day != '0' and xml.day day
+          }
+        }
+        extIds = {}
+        ids.each { |scheme, id|
+          if scheme == 'doi'
+            xml.doi { xml.text_ id }
+          elsif isCampusID(scheme)
+            xml.field(name: scheme) { xml.text_ id }
+          else
+            extIds[scheme] = id
+          end
+        }
+        if !extIds.empty?
+          xml.send('external-identifiers') {
+            xml.identifiers {
+              extIds.each { |scheme, id|
+                xml.identifier(scheme: scheme) { xml.text id }
+              }
+            }
+          }
+        end
+      }
+    }
+  }.to_xml
+
+  puts putData
+  exit 2
+end
+
+###################################################################################################
 # Top-level driver
 def main
 
@@ -427,21 +550,24 @@ def main
     pub.items.each { |item|
       item.ids.each { |scheme, id|
         gotEschol ||= (scheme == 'c-eschol-id')
-        gotCampus ||= (scheme =~ /^c-(uci|ucla|ucsf)-id/)
+        gotCampus ||= (scheme =~ /^c-uc\w+-id/)
       }
     }
 
-    if pub.items.length > 1 && gotEschol && gotCampus
-      puts
-      puts "User emails: #{pub.userEmails.to_a.join(', ')}"
-      puts "User ids   : #{pub.userPropIds.to_a.join(', ')}"
-      pub.items.each { |item|
-        idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-        puts "#{item.title}"
-        puts "    #{item.date}     #{item.authors.join(', ')}"
-        puts "    #{idStr}"
-      }
-    end
+    # For now, skip the non-interesting items
+    next if pub.items.length == 1 || !gotEschol || !gotCampus
+
+    puts
+    puts "User emails: #{pub.userEmails.to_a.join(', ')}"
+    puts "User ids   : #{pub.userPropIds.to_a.join(', ')}"
+    pub.items.each { |item|
+      idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
+      puts "#{item.title}"
+      puts "    #{item.date}     #{item.authors.join(', ')}"
+      puts "    #{idStr}"
+    }
+
+    importPub(pub)
   }
 end
 

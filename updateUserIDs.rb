@@ -30,6 +30,7 @@ def updateEmails(filename, db)
   doc.xpath('records/*').each { |record|
     record.name == 'record' or raise("Unknown record type '#{record.name}'")
     email = record.text_at("field[@name='[Email]']") or raise("Record missing email field: #{record}")
+    email = email.downcase.strip
     propID = record.text_at("field[@name='[Proprietary_ID]']") or raise("Record missing proprietary ID field: #{record}")
 
     # Experiment: change foo@dept.ucla.edu to foo@ucla.edu
