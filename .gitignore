@@ -3,5 +3,7 @@ gems
 oap.db
 *.xml
 *.xml.gz
+*.bak
 Gemfile.lock
 cache/*.cache
+trans.log

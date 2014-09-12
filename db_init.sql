@@ -16,3 +16,11 @@ CREATE TABLE emails (
 );
 
 CREATE INDEX proprietary_id ON emails(proprietary_id);
+
+-- Table of Elements publication ID -> OAP ID. This is always 1-to-1
+CREATE TABLE pubs (
+  pub_id       TEXT PRIMARY KEY NOT NULL,
+  oap_id       TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX pub_oap_id ON pubs(oap_id);

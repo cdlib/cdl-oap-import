@@ -9,6 +9,7 @@
 # The code is very much a work in progress.
 
 # System libraries
+require 'cgi'
 require 'date'
 require 'ezid'
 require 'fileutils'
@@ -31,6 +32,7 @@ $pubs = []
 $emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
 $credentials = nil
 $db = SQLite3::Database.new("oap.db")
+$transLog = nil
 
 # Common English stop-words
 $stopwords = Set.new(("a an the of and to in that was his he it with is for as had you not be her on at by which have or " +
@@ -41,6 +43,15 @@ Item = Struct.new(:title, :docKey, :authors, :date, :ids, :journal, :volume, :is
 
 # Structure for holding a group of duplicate items
 OAPub = Struct.new(:items, :userEmails, :userPropIds)
+
+###################################################################################################
+# Determine the Elements API instance to connect to, based on the host name
+hostname = `/bin/hostname`.strip
+$elementsAPI = case hostname
+  when 'submit-stg', 'submit-dev'; 'https://qa-oapolicy.universityofcalifornia.edu:8002/elements-secure-api'
+  when 'cdl-submit-p01'; 'https://oapolicy.universityofcalifornia.edu:8002/elements-secure-api'
+  else 'http://unknown-host/elements-secure-api'
+end
 
 # We need to identify recurring series items and avoid grouping them. Best way seems to be just by title.
 seriesTitles = [
@@ -274,7 +285,7 @@ def readItems(filename)
         #puts "Skipping dupe record for campus id #{dupeCampusID}."
         nDupes += 1
         next
-      else
+     else
         item = Item.new(title, docKey, authors, date, ids, journal, volume, issue)
         items << item
         #puts item
@@ -284,8 +295,8 @@ def readItems(filename)
       nParsed += 1
       if (nParsed % 1000) == 0
         puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
-        # TODO: For debugging speed, stop after 5000 records. For real production run, take this out!
-        break if nParsed == 5000
+        # TODO: For debugging speed, stop after 10000 records. For real production run, take this out!
+        break if nParsed == 10000
       end      
     }
     puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
@@ -405,6 +416,7 @@ def importPub(pub)
   # Pick the best item for its metadata
   bestItem = pub.items.inject { |memo, item| isBetterItem(item, memo) ? item : memo }
 
+  # De-dupe the identifiers. If there's a conflict, pick the longer one.
   ids = {}
   pub.items.each { |item|
     item.ids.each { |scheme, id|
@@ -442,10 +454,12 @@ def importPub(pub)
   }
 
   # Form the XML that we will PUT into Elements
-  puts "best: #{bestItem}"
-  putData = Nokogiri::XML::Builder.new { |xml|
-    xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api") {
+  toPut = Nokogiri::XML::Builder.new { |xml|
+    xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api", 
+            'type-id' => '5') { # 5 = journal-article
       xml.native {
+
+        # Title, author, journal/vol/iss, and date all taken from a single item chosen as the "best"
         xml.field(name: 'title') { xml.text_ bestItem.title }
         xml.field(name: 'authors') {
           xml.people {
@@ -472,6 +486,8 @@ def importPub(pub)
             day != '0' and xml.day day
           }
         }
+
+        # Identifiers from all items, but de-duped
         extIds = {}
         ids.each { |scheme, id|
           if scheme == 'doi'
@@ -495,7 +511,15 @@ def importPub(pub)
     }
   }.to_xml
 
-  puts putData
+  # Figure out the URL to send it to
+  url = "#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}"
+
+  # Log what we're about to put.
+  $transLog.write("\n---------------------------------------------------------------\n")
+  $transLog.write("\nPUT #{url}\n\n")
+  $transLog.write(toPut)
+
+  puts toPut
   exit 2
 end
 
@@ -550,7 +574,8 @@ def main
     pub.items.each { |item|
       item.ids.each { |scheme, id|
         gotEschol ||= (scheme == 'c-eschol-id')
-        gotCampus ||= (scheme =~ /^c-uc\w+-id/)
+        #gotCampus ||= (scheme =~ /^c-uc\w+-id/)
+        gotCampus ||= (scheme =~ /^c-uci-id/)
       }
     }
 
@@ -571,4 +596,8 @@ def main
   }
 end
 
-main()
+# Record the actions in the transaction log file
+open("trans.log", "w:utf-8") { |io|
+  $transLog = io
+  main()
+}
