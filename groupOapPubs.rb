@@ -574,6 +574,7 @@ def importPub(pub)
     native or native = obj.at("records/record[@format='native'][source-name='crossref']")
     native or native = otherRecords[0]
     elemItem = parseElemNativeRecord(native.at('native'))
+    puts "Got elemItem back: #{elemItem}"
     isElemCompat = isCompatible(pub.items, elemItem)
     if not isElemCompat
       puts "NOTE: incompatible join."
@@ -624,7 +625,8 @@ def importPub(pub)
     res.is_a?(Net::HTTPSuccess) or raise("Error: post failed: #{res}")
   }
 
-  exit 2
+  print "Record done. Hit Enter to do another: "
+  STDIN.gets
 end
 
 ###################################################################################################
@@ -675,6 +677,9 @@ def main
   # Print the interesting (i.e. non-singleton) groups
   $pubs.each { |pub|
 
+    # If no user ids, there's no point in uploading the item
+    pub.userPropIds or next
+
     # See all the kinds of ids we got
     gotEschol = false
     gotCampus = false
@@ -687,7 +692,7 @@ def main
     }
 
     # For now, skip the non-interesting items
-    next if pub.items.length == 1 || !gotEschol || !gotCampus
+    #next if pub.items.length == 1 || !gotEschol || !gotCampus
 
     puts
     puts "User emails: #{pub.userEmails.to_a.join(', ')}"
@@ -701,6 +706,8 @@ def main
 
     importPub(pub)
   }
+
+  puts "All done."
 end
 
 # Record the actions in the transaction log file
