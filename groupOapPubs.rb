@@ -13,6 +13,7 @@ require 'cgi'
 require 'date'
 require 'ezid'
 require 'fileutils'
+require 'net/http'
 require 'netrc'
 require 'nokogiri'
 require 'ostruct'
@@ -206,6 +207,58 @@ def isCompatible(items, cand)
 end
 
 ###################################################################################################
+def parseElemNativeRecord(native)
+
+  # Title parsing and doc key generation
+  title = normalize(native.text_at("field[@name='title']/text"))
+  docKey = filterTitle(title).join(' ')
+
+  # Author parsing
+  authors = native.xpath("field[@name='authors']/people/person").map { |person|
+    lname = normalize(person.text_at('last-name'))
+    initials = normalize(person.text_at('initials'))
+    email = normalize(person.text_at('email-address'))
+    "#{lname}, #{initials}|#{email}"
+  }
+  
+  # Date parsing
+  dateField = native.at("field[@name='publication-date']/date")
+  if dateField
+    year = dateField.at("year") ? dateField.at("year").text : '0'
+    month = dateField.at("month") ? dateField.at("month").text : '0'
+    day = dateField.at("day") ? dateField.at("day").text : '0'
+    date = "#{year.rjust(4,'0')}-#{month.rjust(2,'0')}-#{day.rjust(2,'0')}"
+  else
+    date = nil
+  end
+
+  # Identifier parsing
+  ids = []
+  ['eschol', 'ucla', 'uci', 'ucsf'].each { |campus|
+    tmp = native.text_at("field[@name='c-#{campus}-id']/text")
+    tmp and ids << ["c-#{campus}-id", normalizeIdentifier(tmp)]
+  }
+
+  tmp = native.text_at("doi/text")
+  tmp or tmp = native.text_at("field[@name='doi']/text")
+  tmp and ids << ['doi', normalizeIdentifier(tmp)]
+
+  native.xpath("field[@name='external-identifiers']/identifiers/identifier").each { |ident|
+    scheme = ident['scheme'].downcase.strip
+    text = normalizeIdentifier(ident.text)
+    ids << [scheme, text]
+  }
+
+  # Journal/vol/iss
+  journal = native.text_at("field[@name='journal']/text")
+  volume  = native.text_at("field[@name='volume']/text")
+  issue   = native.text_at("field[@name='issue']/text")
+
+  # Bundle up the result
+  return Item.new(title, docKey, authors, date, ids, journal, volume, issue)
+end
+
+###################################################################################################
 def readItems(filename)
   FileUtils::mkdir_p('cache')
   cacheFile = "cache/#{filename}.cache"
@@ -224,69 +277,26 @@ def readItems(filename)
     nTotal = doc.xpath('records/*').length
     doc.xpath('records/*').each { |record|
       record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
-      native = record.at('native')
-
-      # Title parsing and doc key generation
-      title = normalize(native.text_at("field[@name='title']/text"))
-      docKey = filterTitle(title).join(' ')
-
-      # Author parsing
-      authors = native.xpath("field[@name='authors']/people/person").map { |person|
-        lname = normalize(person.text_at('last-name'))
-        initials = normalize(person.text_at('initials'))
-        email = normalize(person.text_at('email-address'))
-        "#{lname}, #{initials}|#{email}"
-      }
-      
-      # Date parsing
-      dateField = native.at("field[@name='publication-date']/date")
-      if dateField
-        year = dateField.at("year") ? dateField.at("year").text : '0'
-        month = dateField.at("month") ? dateField.at("month").text : '0'
-        day = dateField.at("day") ? dateField.at("day").text : '0'
-        date = "#{year.rjust(4,'0')}-#{month.rjust(2,'0')}-#{day.rjust(2,'0')}"
-      else
-        date = nil
-      end
+      item = parseElemNativeRecord(record.at('native'))
 
       # Identifier parsing
       dupeCampusID = false
       gotCampusID = false
-      ids = []
-      ['eschol', 'ucla', 'uci', 'ucsf'].each { |campus|
-        tmp = native.text_at("field[@name='c-#{campus}-id']/text")
-        if tmp
-          tmp = normalizeIdentifier(tmp)
-          dupeCampusId ||= campusIds.include?(tmp)
-          campusIds << tmp
-          ids << ["c-#{campus}-id", tmp]
+      item.ids.each { |scheme, text|
+        if isCampusID(scheme)
+          dupeCampusID ||= campusIds.include?(text)
+          campusIds << text
           gotCampusID = true
         end
       }
       
       gotCampusID or raise("No campus ID found: #{record}")
 
-      tmp = native.text_at("doi/text")
-      tmp and ids << ['doi', normalizeIdentifier(tmp)]
-
-      native.xpath("field[@name='external-identifiers']/identifiers/identifier").each { |ident|
-        scheme = ident['scheme'].downcase.strip
-        text = normalizeIdentifier(ident.text)
-        ids << [scheme, text]
-      }
-
-      # Journal/vol/iss
-      journal = native.text_at("field[@name='journal']/text")
-      volume  = native.text_at("field[@name='volume']/text")
-      issue   = native.text_at("field[@name='issue']/text")
-
       # Bundle up the result
       if dupeCampusID
-        #puts "Skipping dupe record for campus id #{dupeCampusID}."
         nDupes += 1
         next
      else
-        item = Item.new(title, docKey, authors, date, ids, journal, volume, issue)
         items << item
         #puts item
       end
@@ -403,10 +413,69 @@ def isBetterItem(item1, item2)
     date = item.date.gsub("-01", "-1").gsub("-00", "-")  # penalize less-exact dates
     authors = item.authors.map { |auth| auth.split("|")[0] }.join(';')
     str = "#{title}|#{date}|#{authors}|#{item.journal}|#{item.volume}|#{item.issue}"
-    puts str
     return str
   end
   return makeItemStr(item1).length > makeItemStr(item2).length
+end
+
+###################################################################################################
+def makeRecordToPut(item, ids)
+  Nokogiri::XML::Builder.new { |xml|
+    xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api", 
+            'type-id' => '5') { # 5 = journal-article
+      xml.native {
+
+        # Title, author, journal/vol/iss, and date all taken from a single item chosen as the "best"
+        xml.field(name: 'title') { xml.text_ item.title }
+        xml.field(name: 'authors') {
+          xml.people {
+            item.authors.each { |auth|
+              xml.person {
+                name, email = auth.split("|")
+                last, initials = name.split(", ")
+                xml.send('last-name', last)
+                xml.initials(initials)
+                email and email.strip != '' and xml.send('email-address', email)
+              }
+            }
+          }
+        }
+        item.journal and xml.field(name: 'journal') { xml.text_ item.journal }
+        item.volume and xml.field(name: 'volume') { xml.text_ item.volume }
+        item.issue and xml.field(name: 'issue') { xml.text_ item.issue }
+        xml.field(name: 'publication-date') {
+          xml.date {
+            item.date =~ /(\d\d\d\d)-0*(\d+)-0*(\d+)/
+            year, month, day = $1, $2, $3
+            year != 0 and xml.year year
+            month != '0' and xml.month month
+            day != '0' and xml.day day
+          }
+        }
+
+        # Identifiers from all items, but de-duped
+        extIds = {}
+        ids.each { |scheme, id|
+          if scheme == 'doi'
+            xml.doi { xml.text_ id }
+          elsif isCampusID(scheme)
+            xml.field(name: scheme) { xml.text_ id }
+          else
+            extIds[scheme] = id
+          end
+        }
+        if !extIds.empty?
+          xml.send('external-identifiers') {
+            xml.identifiers {
+              extIds.each { |scheme, id|
+                xml.identifier(scheme: scheme) { xml.text id }
+              }
+            }
+          }
+        end
+      }
+    }
+  }.to_xml
 end
 
 ###################################################################################################
@@ -454,72 +523,107 @@ def importPub(pub)
   }
 
   # Form the XML that we will PUT into Elements
-  toPut = Nokogiri::XML::Builder.new { |xml|
-    xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api", 
-            'type-id' => '5') { # 5 = journal-article
-      xml.native {
-
-        # Title, author, journal/vol/iss, and date all taken from a single item chosen as the "best"
-        xml.field(name: 'title') { xml.text_ bestItem.title }
-        xml.field(name: 'authors') {
-          xml.people {
-            bestItem.authors.each { |auth|
-              xml.person {
-                name, email = auth.split("|")
-                last, initials = name.split(", ")
-                xml.send('last-name', last)
-                xml.initials(initials)
-                email and email.strip != '' and xml.send('email-address', email)
-              }
-            }
-          }
-        }
-        bestItem.journal and xml.field(name: 'journal') { xml.text_ bestItem.journal }
-        bestItem.volume and xml.field(name: 'volume') { xml.text_ bestItem.volume }
-        bestItem.issue and xml.field(name: 'issue') { xml.text_ bestItem.issue }
-        xml.field(name: 'publication-date') {
-          xml.date {
-            bestItem.date =~ /(\d\d\d\d)-0*(\d+)-0*(\d+)/
-            year, month, day = $1, $2, $3
-            year != 0 and xml.year year
-            month != '0' and xml.month month
-            day != '0' and xml.day day
-          }
-        }
-
-        # Identifiers from all items, but de-duped
-        extIds = {}
-        ids.each { |scheme, id|
-          if scheme == 'doi'
-            xml.doi { xml.text_ id }
-          elsif isCampusID(scheme)
-            xml.field(name: scheme) { xml.text_ id }
-          else
-            extIds[scheme] = id
-          end
-        }
-        if !extIds.empty?
-          xml.send('external-identifiers') {
-            xml.identifiers {
-              extIds.each { |scheme, id|
-                xml.identifier(scheme: scheme) { xml.text id }
-              }
-            }
-          }
-        end
-      }
-    }
-  }.to_xml
+  toPut = makeRecordToPut(bestItem, ids)
 
   # Figure out the URL to send it to
-  url = "#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}"
+  uri = URI("#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}")
 
   # Log what we're about to put.
   $transLog.write("\n---------------------------------------------------------------\n")
-  $transLog.write("\nPUT #{url}\n\n")
+  $transLog.write("\nPUT #{uri}\n\n")
   $transLog.write(toPut)
 
-  puts toPut
+  # And put it
+  puts "Putting record."
+  req = Net::HTTP::Put.new(uri)
+  req['Content-Type'] = 'text/xml'
+  req.basic_auth $apiCred[0], $apiCred[1]
+  req.body = toPut
+  res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
+    http.request req
+  }
+
+  # Log the response
+  puts "Response: #{res.inspect}"
+  $transLog.write("\nResponse:\n")
+  $transLog.write("#{res}\n")
+  $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
+
+  # Fail if the PUT failed
+  res.is_a?(Net::HTTPSuccess) or raise("Error: put failed: #{res}")
+
+  # Parse the result and record the associated Elements publication ID
+  putResult = Nokogiri::XML(res.body, &:noblanks)
+  putResult.remove_namespaces!
+  pubID = putResult.at("entry/object[@category='publication']")['id']
+  $db.execute("INSERT OR REPLACE INTO pubs (pub_id, oap_id) VALUES (?, ?)", [pubID, oapID])
+
+  # We want to know if Elements created a new record or joined to an existing one. We can tell
+  # by checking if there are any other sources.
+  obj = putResult.at("entry/object[@category='publication']")
+  otherRecords = obj.xpath("records/record[@format='native']").select { |el| el['source-name'] != 'c-inst-1' }
+  sources = otherRecords.map { |el| el['source-name'] }
+  isJoinedRecord = !sources.empty?
+
+  # Also we're curious if the joined record would meet our joining criteria. For that we need
+  # to parse the metadata from the first record.
+  isElemCompat = false
+  if isJoinedRecord
+    # Pick scopus and crossref over other kinds of records, if available
+    native = obj.at("records/record[@format='native'][source-name='scopus']")
+    native or native = obj.at("records/record[@format='native'][source-name='crossref']")
+    native or native = otherRecords[0]
+    elemItem = parseElemNativeRecord(native.at('native'))
+    isElemCompat = isCompatible(pub.items, elemItem)
+    if not isElemCompat
+      puts "NOTE: incompatible join."
+      puts "Original items:"
+      pub.items.each { |item| puts "    #{item}"  }
+      puts "Elements item:"
+      puts "    #{elemItem}"
+      raise "exiting early"
+    end
+  else
+    puts "NOTE: record not joined."
+    raise "exiting early"
+  end
+
+  # Now associate this record with each author
+  pub.userPropIds.each { |userPropID|
+    toPost = Nokogiri::XML::Builder.new { |xml|
+      xml.send('import-relationship', 'xmlns' => "http://www.symplectic.co.uk/publications/api") {
+        xml.send('from-object', "publication(source-c-inst-1,pid-#{oapID})")
+        xml.send('to-object', "user(pid-#{userPropID})")
+        xml.send('type-name', "publication-user-authorship")
+      }
+    }.to_xml
+    uri = URI("#{$elementsAPI}/relationships")
+
+    # Log what we're about to POST.
+    $transLog.write("\n---------------------------------------------------------------\n")
+    $transLog.write("\nPOST #{uri}\n\n")
+    $transLog.write(toPost)
+
+    # And put it
+    puts "Posting relationship for user ID #{userPropID}."
+    req = Net::HTTP::Post.new(uri)
+    req['Content-Type'] = 'text/xml'
+    req.basic_auth $apiCred[0], $apiCred[1]
+    req.body = toPost
+    res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
+      http.request req
+    }
+
+    # Log the response
+    puts "Response: #{res.inspect}"
+    $transLog.write("\nResponse:\n")
+    $transLog.write("#{res}\n")
+    $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
+
+    # Fail if the POST failed
+    res.is_a?(Net::HTTPSuccess) or raise("Error: post failed: #{res}")
+  }
+
   exit 2
 end
 
@@ -528,13 +632,16 @@ end
 def main
 
   # We'll need credentials for talking to EZID
-  (cred = Netrc.read['ezid.cdlib.org']) or raise("Need credentials for ezid.cdlib.org in ~/.netrc")
+  (ezidCred = Netrc.read['ezid.cdlib.org']) or raise("Need credentials for ezid.cdlib.org in ~/.netrc")
   puts "Starting EZID session."
-  $ezidSession = Ezid::ApiSession.new(cred[0], cred[1], :ark, '99999/fk4', 'https://ezid.cdlib.org')
+  $ezidSession = Ezid::ApiSession.new(ezidCred[0], ezidCred[1], :ark, '99999/fk4', 'https://ezid.cdlib.org')
   #puts "Minting an ARK."
   #puts mintOAPID({'erc.who' => 'eScholarship harvester',
   #                'erc.what' => 'A test OAP identifier',
   #                'erc.when' => DateTime.now.iso8601})
+
+  # Need credentials for talking to the Elements API
+  ($apiCred = Netrc.read[URI($elementsAPI).host]) or raise("Need credentials for #{URI($elementsAPI).host} in ~/.netrc")
 
   # Read the primary data, parse it, and build our hashes
   puts "Reading and adding items."
@@ -597,7 +704,8 @@ def main
 end
 
 # Record the actions in the transaction log file
-open("trans.log", "w:utf-8") { |io|
+FileUtils::mkdir_p('log')
+open("log/trans-#{DateTime.now.strftime('%F')}.log", "a:utf-8") { |io|
   $transLog = io
   main()
 }

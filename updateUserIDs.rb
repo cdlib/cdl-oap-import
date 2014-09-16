@@ -41,15 +41,15 @@ def updateEmails(filename, db)
     #email2 != email and emails.include?(email2) and puts("Bad: dupe email #{email2}")
     #email2 != email and emails << email2
 
-    existing = db.get_first_value("SELECT proprietary_id FROM emails WHERE email=?", email)
+    existing = db.get_first_value("SELECT proprietary_id FROM emails WHERE email=?", [email])
     if existing == propID
       #puts "No update for #{email} -> #{propID}"
     elsif existing
       puts "Update #{email}: old=#{existing} new=#{propID}"
-      db.execute("UPDATE emails SET proprietary_id = ? WHERE email = ?", propID, email)
+      db.execute("UPDATE emails SET proprietary_id = ? WHERE email = ?", [propID, email])
     else
       puts "Insert #{email} -> #{propID}"
-      db.execute("INSERT INTO emails VALUES (?,?)", email, propID)
+      db.execute("INSERT INTO emails VALUES (?,?)", [email, propID])
     end
   }
 end

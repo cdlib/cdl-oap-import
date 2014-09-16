@@ -1,5 +1,6 @@
 bin
 gems
+log
 oap.db
 *.xml
 *.xml.gz
