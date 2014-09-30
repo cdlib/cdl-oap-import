@@ -11,6 +11,7 @@
 # System libraries
 require 'cgi'
 require 'date'
+require 'digest/sha1'
 require 'ezid'
 require 'fileutils'
 require 'net/http'
@@ -33,6 +34,7 @@ $pubs = []
 $emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
 $credentials = nil
 $db = SQLite3::Database.new("oap.db")
+$db.busy_timeout = 30000
 $transLog = nil
 
 # Common English stop-words
@@ -141,7 +143,14 @@ def normalizeIdentifier(str)
   str or return ''
   tmp = str.downcase.strip
   tmp = tmp.sub(/^https?:\/\/dx.doi.org\//, '').sub(/^(doi(\.org)?|pmid|pmcid):/, '').sub(/\.+$/, '')
+  tmp = tmp.sub(/^\[(.*)\]$/, '\1').sub(/^"(.*)"$/, '\1').sub(/^\[(.*)\]$/, '\1').sub(/^"(.*)"$/, '\1')
   return tmp
+end
+
+###################################################################################################
+# Special normalization for ERC metadata
+def normalizeERC(str)
+  return normalize(str).encode('ascii', {:replace => '.'})
 end
 
 ###################################################################################################
@@ -306,7 +315,7 @@ def readItems(filename)
       if (nParsed % 1000) == 0
         puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
         # TODO: For debugging speed, stop after 10000 records. For real production run, take this out!
-        break if nParsed == 10000
+        #break if nParsed == 10000
       end      
     }
     puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
@@ -370,22 +379,11 @@ def groupItems()
         end
       }
 
-      # Match it up to Elements users
-      pub.items.each { |item|
-        item.authors.each { |author|
-          email = author.gsub(/.*\|/, '').downcase.strip
-          propId = $emailToElementsUser[email]
-          if propId
-            (pub.userEmails ||= Set.new) << email
-            (pub.userPropIds ||= Set.new) << propId
-          end
-        }
-      }
-
       # Done with this grouped publication
       $pubs << pub
     end
   }
+
 end
 
 ###################################################################################################
@@ -407,19 +405,19 @@ def longerOf(str1, str2)
 end
 
 ###################################################################################################
+def makeItemStr(item)
+  title = normalize(item.title)
+  date = item.date.gsub("-01", "-1").gsub("-00", "-")  # penalize less-exact dates
+  authors = item.authors.map { |auth| auth.split("|")[0] }.join(';')
+  str = "#{title}|#{date}|#{authors}|#{item.journal}|#{item.volume}|#{item.issue}"
+  return str
+end
 def isBetterItem(item1, item2)
-  def makeItemStr(item)
-    title = normalize(item.title)
-    date = item.date.gsub("-01", "-1").gsub("-00", "-")  # penalize less-exact dates
-    authors = item.authors.map { |auth| auth.split("|")[0] }.join(';')
-    str = "#{title}|#{date}|#{authors}|#{item.journal}|#{item.volume}|#{item.issue}"
-    return str
-  end
   return makeItemStr(item1).length > makeItemStr(item2).length
 end
 
 ###################################################################################################
-def makeRecordToPut(item, ids)
+def makeRecordToPut(item, dedupedIds)
   Nokogiri::XML::Builder.new { |xml|
     xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api", 
             'type-id' => '5') { # 5 = journal-article
@@ -443,32 +441,41 @@ def makeRecordToPut(item, ids)
         item.journal and xml.field(name: 'journal') { xml.text_ item.journal }
         item.volume and xml.field(name: 'volume') { xml.text_ item.volume }
         item.issue and xml.field(name: 'issue') { xml.text_ item.issue }
-        xml.field(name: 'publication-date') {
-          xml.date {
-            item.date =~ /(\d\d\d\d)-0*(\d+)-0*(\d+)/
-            year, month, day = $1, $2, $3
-            year != 0 and xml.year year
-            month != '0' and xml.month month
-            day != '0' and xml.day day
+        if item.date
+          xml.field(name: 'publication-date') {
+            xml.date {
+              item.date =~ /(\d\d\d\d)-0*(\d+)-0*(\d+)/
+              year, month, day = $1, $2, $3
+              year != 0 and xml.year year
+              month != '0' and xml.month month
+              day != '0' and xml.day day
+            }
           }
-        }
+        end
 
         # Identifiers from all items, but de-duped
+        idsByScheme = Hash.new{|h, k| h[k] = Array.new }
         extIds = {}
-        ids.each { |scheme, id|
+        dedupedIds.each { |scheme, id| 
+          idsByScheme[scheme] << normalizeIdentifier(id) 
+        }
+        idsByScheme.each { |scheme, ids|
           if scheme == 'doi'
-            xml.doi { xml.text_ id }
+            ids.length == 1 or raise("cannot have #{ids.length} DOIs in a record")
+            xml.field(name: 'doi') { xml.text_ idsByScheme['doi'][0] }
           elsif isCampusID(scheme)
-            xml.field(name: scheme) { xml.text_ id }
+            xml.field(name: scheme) { xml.text_ ids.join(', ') }
           else
-            extIds[scheme] = id
+            ids.length == 1 or raise("cannot have #{ids.length} #{scheme} IDs in a record")
+            extIds[scheme] = ids
           end
         }
         if !extIds.empty?
-          xml.send('external-identifiers') {
+          xml.field(name: 'external-identifiers') {
             xml.identifiers {
-              extIds.each { |scheme, id|
-                xml.identifier(scheme: scheme) { xml.text id }
+              extIds.each { |scheme, ids|
+                scheme == 'pmid' and scheme = 'pubmed'   # map pmid -> pubmed
+                xml.identifier(scheme: scheme) { xml.text ids[0] }
               }
             }
           }
@@ -479,19 +486,126 @@ def makeRecordToPut(item, ids)
 end
 
 ###################################################################################################
+# Do the work of putting a record into Elements and recording the result.
+# Returns: isJoinedRecord, isElemCompat, elemItem
+def putRecord(pub, oapID, toPut)
+
+    # Figure out the URL to send it to
+    uri = URI("#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}")
+
+    # Log what we're about to put.
+    $transLog.write("\n---------------------------------------------------------------\n")
+    $transLog.write("\nPUT #{uri}\n\n")
+    $transLog.write(toPut)
+    $transLog.flush
+
+    # And put it
+    req = Net::HTTP::Put.new(uri)
+    req['Content-Type'] = 'text/xml'
+    req.basic_auth $apiCred[0], $apiCred[1]
+    req.body = toPut
+    (1..3).each { |tryNumber|
+      puts "  Putting record."
+      res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
+        http.request req
+      }
+
+      # Log the response
+      $transLog.write("\nResponse:\n")
+      $transLog.write("#{res}\n")
+      $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
+
+      # HTTPConflict happens occasionally, and is probably a transitory concurrency issue.
+      if res.is_a?(Net::HTTPConflict)
+        puts "  Failed due to HTTPConflict error (likely a transitory concurrency issue)."
+        if tryNumber < 3
+          puts "Will retry after a 3-second pause."
+          next
+        else
+          puts "Out of retries. Aborting."
+          raise
+        end  
+      end
+
+      # Fail if the PUT failed for any other reason
+      res.is_a?(Net::HTTPSuccess) or raise("Error: put failed: #{res}")
+
+      # Parse the result and record the associated Elements publication ID
+      putResult = Nokogiri::XML(res.body, &:noblanks)
+      putResult.remove_namespaces!
+      pubID = putResult.at("entry/object[@category='publication']")['id']
+      $db.execute("INSERT OR REPLACE INTO pubs (pub_id, oap_id) VALUES (?, ?)", [pubID, oapID])
+
+      # We want to know if Elements created a new record or joined to an existing one. We can tell
+      # by checking if there are any other sources.
+      obj = putResult.at("entry/object[@category='publication']")
+      otherRecords = obj.xpath("records/record[@format='native']").select { |el| el['source-name'] != 'c-inst-1' }
+      sources = otherRecords.map { |el| el['source-name'] }
+      isJoinedRecord = !sources.empty?
+
+      # Also we're curious if the joined record would meet our joining criteria. For that we need
+      # to parse the metadata from the first record.
+      isElemCompat = false
+      elemItem = nil
+      if isJoinedRecord
+        # Pick scopus and crossref over other kinds of records, if available
+        native = obj.at("records/record[@format='native'][source-name='scopus']")
+        native or native = obj.at("records/record[@format='native'][source-name='crossref']")
+        native or native = otherRecords[0]
+        elemItem = parseElemNativeRecord(native.at('native'))
+        isElemCompat = isCompatible(pub.items, elemItem)
+      end
+
+      return isJoinedRecord, isElemCompat, elemItem
+    }
+
+end
+
+###################################################################################################
+# Add a relationship between a publication and a user in Elements
+def postRelationship(oapID, userPropID)
+  toPost = Nokogiri::XML::Builder.new { |xml|
+    xml.send('import-relationship', 'xmlns' => "http://www.symplectic.co.uk/publications/api") {
+      xml.send('from-object', "publication(source-c-inst-1,pid-#{oapID})")
+      xml.send('to-object', "user(pid-#{userPropID})")
+      xml.send('type-name', "publication-user-authorship")
+    }
+  }.to_xml
+  uri = URI("#{$elementsAPI}/relationships")
+
+  # Log what we're about to POST.
+  $transLog.write("\n---------------------------------------------------------------\n")
+  $transLog.write("\nPOST #{uri}\n\n")
+  $transLog.write(toPost)
+
+  # And put it
+  puts "  Posting relationship for user ID #{userPropID}."
+  req = Net::HTTP::Post.new(uri)
+  req['Content-Type'] = 'text/xml'
+  req.basic_auth $apiCred[0], $apiCred[1]
+  req.body = toPost
+  res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
+    http.request req
+  }
+
+  # Log the response
+  $transLog.write("\nResponse:\n")
+  $transLog.write("#{res}\n")
+  $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
+
+  # Fail if the POST failed
+  res.is_a?(Net::HTTPSuccess) or raise("Error: post failed: #{res}")
+end
+
+###################################################################################################
 # Bring this grouped publication into Elements
 def importPub(pub)
 
   # Pick the best item for its metadata
   bestItem = pub.items.inject { |memo, item| isBetterItem(item, memo) ? item : memo }
 
-  # De-dupe the identifiers. If there's a conflict, pick the longer one.
-  ids = {}
-  pub.items.each { |item|
-    item.ids.each { |scheme, id|
-      ids[scheme] = longerOf(ids[scheme], id)
-    }
-  }
+  # Combine all the identifiers and remove duplicates
+  ids = pub.items.map { |item| item.ids }.flatten(1).uniq
 
   # For existing groups, we'll already have an identifier in the database.
   oapID = nil
@@ -503,16 +617,16 @@ def importPub(pub)
 
   # If we can't find one, mint a new one.
   if not oapID
-    puts "Can't find OAP ID, minting a new one."
+    puts "  Minting new OAP ID."
     # Determine the EZID metadata
     idStr = ids.to_a.map { |scheme, id| "#{scheme}::#{id}" }.join(' ')
-    meta = { 'erc.what' => "Grouped OA Publication record for '#{bestItem.title}' [IDs #{idStr}]",
-             'erc.who'  => bestItem.authors.map { |auth| auth.split("|")[0] }.join('; '),
+    meta = { 'erc.what' => normalizeERC("Grouped OA Publication record for '#{bestItem.title}' [IDs #{idStr}]"),
+             'erc.who'  => normalizeERC(bestItem.authors.map { |auth| auth.split("|")[0] }.join('; ')),
              'erc.when' => DateTime.now.iso8601 }
     # And mint the ARK
     oapID = mintOAPID(meta)
   end
-  puts "OAP ID: #{oapID}"
+  puts "  OAP ID: #{oapID}"
 
   # Associate this OAP identifier with all the item IDs so that in future this group will reliably
   # receive the same identifier.
@@ -525,108 +639,49 @@ def importPub(pub)
   # Form the XML that we will PUT into Elements
   toPut = makeRecordToPut(bestItem, ids)
 
-  # Figure out the URL to send it to
-  uri = URI("#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}")
-
-  # Log what we're about to put.
-  $transLog.write("\n---------------------------------------------------------------\n")
-  $transLog.write("\nPUT #{uri}\n\n")
-  $transLog.write(toPut)
-
-  # And put it
-  puts "Putting record."
-  req = Net::HTTP::Put.new(uri)
-  req['Content-Type'] = 'text/xml'
-  req.basic_auth $apiCred[0], $apiCred[1]
-  req.body = toPut
-  res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
-    http.request req
-  }
-
-  # Log the response
-  puts "Response: #{res.inspect}"
-  $transLog.write("\nResponse:\n")
-  $transLog.write("#{res}\n")
-  $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
-
-  # Fail if the PUT failed
-  res.is_a?(Net::HTTPSuccess) or raise("Error: put failed: #{res}")
-
-  # Parse the result and record the associated Elements publication ID
-  putResult = Nokogiri::XML(res.body, &:noblanks)
-  putResult.remove_namespaces!
-  pubID = putResult.at("entry/object[@category='publication']")['id']
-  $db.execute("INSERT OR REPLACE INTO pubs (pub_id, oap_id) VALUES (?, ?)", [pubID, oapID])
-
-  # We want to know if Elements created a new record or joined to an existing one. We can tell
-  # by checking if there are any other sources.
-  obj = putResult.at("entry/object[@category='publication']")
-  otherRecords = obj.xpath("records/record[@format='native']").select { |el| el['source-name'] != 'c-inst-1' }
-  sources = otherRecords.map { |el| el['source-name'] }
-  isJoinedRecord = !sources.empty?
-
-  # Also we're curious if the joined record would meet our joining criteria. For that we need
-  # to parse the metadata from the first record.
-  isElemCompat = false
-  if isJoinedRecord
-    # Pick scopus and crossref over other kinds of records, if available
-    native = obj.at("records/record[@format='native'][source-name='scopus']")
-    native or native = obj.at("records/record[@format='native'][source-name='crossref']")
-    native or native = otherRecords[0]
-    elemItem = parseElemNativeRecord(native.at('native'))
-    puts "Got elemItem back: #{elemItem}"
-    isElemCompat = isCompatible(pub.items, elemItem)
-    if not isElemCompat
-      puts "NOTE: incompatible join."
-      puts "Original items:"
-      pub.items.each { |item| puts "    #{item}"  }
-      puts "Elements item:"
-      puts "    #{elemItem}"
-      raise "exiting early"
-    end
+  # Check if we've already put the exact same thing.
+  newHash = Digest::SHA1.hexdigest toPut
+  oldHash = $db.get_first_value('SELECT oap_hash FROM oap_hashes WHERE oap_id = ?', oapID)
+  isUpdated = false
+  if oldHash == newHash
+    puts "  Skip: Existing record is the same."
   else
-    puts "NOTE: record not joined."
-    raise "exiting early"
+    isJoinedRecord, isElemCompat, elemItem = putRecord(pub, oapID, toPut)
+    isUpdated = true
   end
 
-  # Now associate this record with each author
+  # Now associate this record with each author we haven't associated before
+  anyNewUsers = false
+  oldUsers = $db.get_first_value('SELECT oap_users FROM oap_hashes WHERE oap_id = ?', oapID)
+  oldUsers = Set.new(oldUsers ? oldUsers.split('|') : []) 
   pub.userPropIds.each { |userPropID|
-    toPost = Nokogiri::XML::Builder.new { |xml|
-      xml.send('import-relationship', 'xmlns' => "http://www.symplectic.co.uk/publications/api") {
-        xml.send('from-object', "publication(source-c-inst-1,pid-#{oapID})")
-        xml.send('to-object', "user(pid-#{userPropID})")
-        xml.send('type-name', "publication-user-authorship")
-      }
-    }.to_xml
-    uri = URI("#{$elementsAPI}/relationships")
-
-    # Log what we're about to POST.
-    $transLog.write("\n---------------------------------------------------------------\n")
-    $transLog.write("\nPOST #{uri}\n\n")
-    $transLog.write(toPost)
-
-    # And put it
-    puts "Posting relationship for user ID #{userPropID}."
-    req = Net::HTTP::Post.new(uri)
-    req['Content-Type'] = 'text/xml'
-    req.basic_auth $apiCred[0], $apiCred[1]
-    req.body = toPost
-    res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
-      http.request req
-    }
-
-    # Log the response
-    puts "Response: #{res.inspect}"
-    $transLog.write("\nResponse:\n")
-    $transLog.write("#{res}\n")
-    $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
-
-    # Fail if the POST failed
-    res.is_a?(Net::HTTPSuccess) or raise("Error: post failed: #{res}")
+    if oldUsers.include? userPropID
+      puts "  Skip: User #{userPropID} already associated."
+    else
+      postRelationship(oapID, userPropID)
+      anyNewUsers = true
+    end
   }
 
-  print "Record done. Hit Enter to do another: "
-  STDIN.gets
+  # Keep our database up-to-date in terms of what's been sent already to Elements, so we can avoid
+  # re-doing work in the future.
+  if isUpdated or anyNewUsers
+    $db.execute('INSERT OR REPLACE INTO oap_hashes (oap_id, updated, oap_hash, oap_users) VALUES (?, ?, ?, ?)',
+      [oapID, DateTime.now.iso8601, newHash, pub.userPropIds.to_a.join('|')])
+  end
+
+  # For testing, stop on first non-joined or non-compat record
+  if isUpdated && isJoinedRecord && !isElemCompat
+    puts "NOTE: incompatible join - see log for details."
+    $transLog.puts "NOTE: incompatible join: origItems=#{pub.items.join(' ^^ ')} elemItem=#{elemItem}"
+  elsif !isJoinedRecord
+    puts "NOTE: record not joined - see log for details."
+    $transLog.puts "NOTE: record not joined: #{bestItem}"
+  end
+
+  $transLog.flush
+  #print "Record done. Hit Enter to do another: "
+  #STDIN.gets
 end
 
 ###################################################################################################
@@ -671,11 +726,34 @@ def main
   puts "Grouping items."
   groupItems()
 
-  # Count the number that are associated with an Elements user
-  puts "Count of associated: #{$pubs.count { |pub| pub.userEmails }}"
+  puts "Counting by campus."
+  countByCampus = Hash.new{|h, k| h[k] = 0 }
+  $pubs.each { |pub|
+    schemes = Set.new
+    pub.items.each { |item|
+      item.ids.each { |scheme, id|
+        schemes.include?(scheme) or countByCampus[scheme] = countByCampus[scheme] + 1
+        schemes << scheme
+      }
+    }
+  }
+  puts "Number to post, by id scheme: #{countByCampus}"
 
   # Print the interesting (i.e. non-singleton) groups
+  postNum = 0
   $pubs.each { |pub|
+
+    # Match email addresses to Elements users
+    pub.items.each { |item|
+      item.authors.each { |author|
+        email = author.gsub(/.*\|/, '').downcase.strip
+        propId = $emailToElementsUser[email]
+        if propId
+          (pub.userEmails ||= Set.new) << email
+          (pub.userPropIds ||= Set.new) << propId
+        end
+      }
+    }
 
     # If no user ids, there's no point in uploading the item
     pub.userPropIds or next
@@ -687,21 +765,35 @@ def main
       item.ids.each { |scheme, id|
         gotEschol ||= (scheme == 'c-eschol-id')
         #gotCampus ||= (scheme =~ /^c-uc\w+-id/)
-        gotCampus ||= (scheme =~ /^c-uci-id/)
+        gotCampus ||= (scheme =~ /^c-ucsf-id/)
       }
     }
 
-    # For now, skip the non-interesting items
-    #next if pub.items.length == 1 || !gotEschol || !gotCampus
+    # Deposit only one campus at a time for now
+    next if !gotCampus
+
+    if false
+      # This block only processes non-eschol items, that are after the main policy date
+      next if gotEschol
+      puts pub.items[0].date
+      begin
+        next if DateTime.strptime(pub.items[0].date, "%F") < DateTime.new(2013,8,1)
+      rescue
+        next
+      end
+    end
 
     puts
-    puts "User emails: #{pub.userEmails.to_a.join(', ')}"
-    puts "User ids   : #{pub.userPropIds.to_a.join(', ')}"
+    postNum += 1
+    next if postNum < 16050   # Testing later UCSF records
+    puts "Post \##{postNum}:"
+    puts "  User emails: #{pub.userEmails.to_a.join(', ')}"
+    puts "  User ids   : #{pub.userPropIds.to_a.join(', ')}"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-      puts "#{item.title}"
-      puts "    #{item.date}     #{item.authors.join(', ')}"
-      puts "    #{idStr}"
+      puts "  #{item.title}"
+      puts "      #{item.date}     #{item.authors.join(', ')}"
+      puts "      #{idStr}"
     }
 
     importPub(pub)
