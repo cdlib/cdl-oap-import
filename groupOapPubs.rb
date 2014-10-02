@@ -490,74 +490,78 @@ end
 # Returns: isJoinedRecord, isElemCompat, elemItem
 def putRecord(pub, oapID, toPut)
 
-    # Figure out the URL to send it to
-    uri = URI("#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}")
+  # Figure out the URL to send it to
+  uri = URI("#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}")
 
-    # Log what we're about to put.
-    $transLog.write("\n---------------------------------------------------------------\n")
-    $transLog.write("\nPUT #{uri}\n\n")
-    $transLog.write(toPut)
-    $transLog.flush
+  # Log what we're about to put.
+  $transLog.write("\n---------------------------------------------------------------\n")
+  $transLog.write("\nPUT #{uri}\n\n")
+  $transLog.write(toPut)
+  $transLog.flush
 
-    # And put it
-    req = Net::HTTP::Put.new(uri)
-    req['Content-Type'] = 'text/xml'
-    req.basic_auth $apiCred[0], $apiCred[1]
-    req.body = toPut
-    (1..3).each { |tryNumber|
-      puts "  Putting record."
-      res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
-        http.request req
-      }
-
-      # Log the response
-      $transLog.write("\nResponse:\n")
-      $transLog.write("#{res}\n")
-      $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
-
-      # HTTPConflict happens occasionally, and is probably a transitory concurrency issue.
-      if res.is_a?(Net::HTTPConflict)
-        puts "  Failed due to HTTPConflict error (likely a transitory concurrency issue)."
-        if tryNumber < 3
-          puts "Will retry after a 3-second pause."
-          next
-        else
-          puts "Out of retries. Aborting."
-          raise
-        end  
-      end
-
-      # Fail if the PUT failed for any other reason
-      res.is_a?(Net::HTTPSuccess) or raise("Error: put failed: #{res}")
-
-      # Parse the result and record the associated Elements publication ID
-      putResult = Nokogiri::XML(res.body, &:noblanks)
-      putResult.remove_namespaces!
-      pubID = putResult.at("entry/object[@category='publication']")['id']
-      $db.execute("INSERT OR REPLACE INTO pubs (pub_id, oap_id) VALUES (?, ?)", [pubID, oapID])
-
-      # We want to know if Elements created a new record or joined to an existing one. We can tell
-      # by checking if there are any other sources.
-      obj = putResult.at("entry/object[@category='publication']")
-      otherRecords = obj.xpath("records/record[@format='native']").select { |el| el['source-name'] != 'c-inst-1' }
-      sources = otherRecords.map { |el| el['source-name'] }
-      isJoinedRecord = !sources.empty?
-
-      # Also we're curious if the joined record would meet our joining criteria. For that we need
-      # to parse the metadata from the first record.
-      isElemCompat = false
-      elemItem = nil
-      if isJoinedRecord
-        # Pick scopus and crossref over other kinds of records, if available
-        native = obj.at("records/record[@format='native'][source-name='scopus']")
-        native or native = obj.at("records/record[@format='native'][source-name='crossref']")
-        native or native = otherRecords[0]
-        elemItem = parseElemNativeRecord(native.at('native'))
-        isElemCompat = isCompatible(pub.items, elemItem)
-      end
-
-      return isJoinedRecord, isElemCompat, elemItem
+  # And put it
+  req = Net::HTTP::Put.new(uri)
+  req['Content-Type'] = 'text/xml'
+  req.basic_auth $apiCred[0], $apiCred[1]
+  req.body = toPut
+  (1..10).each { |tryNumber|
+    puts "  Putting record."
+    res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
+      http.request req
     }
+
+    # Log the response
+    $transLog.write("\nResponse:\n")
+    $transLog.write("#{res}\n")
+    $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
+
+    # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
+    if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
+      puts "  Warning: failed due to #{res} (likely a transitory concurrency issue)."
+      if tryNumber < 10
+        puts "  Will retry after a 30-second pause."
+        sleep 30
+        next
+      else
+        puts "  Out of retries. Aborting."
+      end  
+    end
+
+    # Fail if the PUT failed
+    res.is_a?(Net::HTTPSuccess) or raise("Error: put failed: #{res}")
+
+    # Parse the result and record the associated Elements publication ID
+    putResult = Nokogiri::XML(res.body, &:noblanks)
+    putResult.remove_namespaces!
+    pubID = putResult.at("entry/object[@category='publication']")['id']
+    $db.execute("INSERT OR REPLACE INTO pubs (pub_id, oap_id) VALUES (?, ?)", [pubID, oapID])
+
+    # We want to know if Elements created a new record or joined to an existing one. We can tell
+    # by checking if there are any other sources.
+    obj = putResult.at("entry/object[@category='publication']")
+    otherRecords = obj.xpath("records/record[@format='native']").select { |el| el['source-name'] != 'c-inst-1' }
+    sources = otherRecords.map { |el| el['source-name'] }
+    isJoinedRecord = !sources.empty?
+
+    # Also we're curious if the joined record would meet our joining criteria. For that we need
+    # to parse the metadata from the first record.
+    isElemCompat = false
+    elemItem = nil
+    if isJoinedRecord
+      # Pick scopus and crossref over other kinds of records, if available
+      native = obj.at("records/record[@format='native'][source-name='scopus']")
+      native or native = obj.at("records/record[@format='native'][source-name='crossref']")
+      native or native = otherRecords[0]
+      elemItem = parseElemNativeRecord(native.at('native'))
+      isElemCompat = isCompatible(pub.items, elemItem)
+    end
+
+    # Give Elements a second to cool off and serve other queries.
+    #sleep 0.5
+
+    # And we're done.
+    return isJoinedRecord, isElemCompat, elemItem
+  }
 
 end
 
@@ -579,22 +583,40 @@ def postRelationship(oapID, userPropID)
   $transLog.write(toPost)
 
   # And put it
-  puts "  Posting relationship for user ID #{userPropID}."
-  req = Net::HTTP::Post.new(uri)
-  req['Content-Type'] = 'text/xml'
-  req.basic_auth $apiCred[0], $apiCred[1]
-  req.body = toPost
-  res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
-    http.request req
+  (1..10).each { |tryNumber|
+
+    puts "  Posting relationship for user ID #{userPropID}."
+    req = Net::HTTP::Post.new(uri)
+    req['Content-Type'] = 'text/xml'
+    req.basic_auth $apiCred[0], $apiCred[1]
+    req.body = toPost
+    res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
+      http.request req
+    }
+
+    # Log the response
+    $transLog.write("\nResponse:\n")
+    $transLog.write("#{res}\n")
+    $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
+
+    # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
+    if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
+      puts "  Warning: failed due to #{res} (likely a transitory concurrency issue)."
+      if tryNumber < 10
+        puts "  Will retry after a 30-second pause."
+        sleep 30
+        next
+      else
+        puts "  Out of retries. Aborting."
+      end  
+    end
+
+    # Fail if the POST failed.
+    res.is_a?(Net::HTTPSuccess) or raise("Error: post failed: #{res}")
+
+    # Otherwise, we're done.
+    return
   }
-
-  # Log the response
-  $transLog.write("\nResponse:\n")
-  $transLog.write("#{res}\n")
-  $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
-
-  # Fail if the POST failed
-  res.is_a?(Net::HTTPSuccess) or raise("Error: post failed: #{res}")
 end
 
 ###################################################################################################
@@ -671,12 +693,14 @@ def importPub(pub)
   end
 
   # For testing, stop on first non-joined or non-compat record
-  if isUpdated && isJoinedRecord && !isElemCompat
-    puts "NOTE: incompatible join - see log for details."
-    $transLog.puts "NOTE: incompatible join: origItems=#{pub.items.join(' ^^ ')} elemItem=#{elemItem}"
-  elsif !isJoinedRecord
-    puts "NOTE: record not joined - see log for details."
-    $transLog.puts "NOTE: record not joined: #{bestItem}"
+  if isUpdated
+    if isJoinedRecord && !isElemCompat
+      puts "NOTE: incompatible join - see log for details."
+      $transLog.puts "NOTE: incompatible join: origItems=#{pub.items.join(' ^^ ')} elemItem=#{elemItem}"
+    elsif !isJoinedRecord
+      puts "NOTE: record not joined - see log for details."
+      $transLog.puts "NOTE: record not joined: #{bestItem}"
+    end
   end
 
   $transLog.flush
@@ -785,7 +809,6 @@ def main
 
     puts
     postNum += 1
-    next if postNum < 16050   # Testing later UCSF records
     puts "Post \##{postNum}:"
     puts "  User emails: #{pub.userEmails.to_a.join(', ')}"
     puts "  User ids   : #{pub.userPropIds.to_a.join(', ')}"
