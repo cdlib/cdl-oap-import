@@ -268,6 +268,64 @@ def parseElemNativeRecord(native)
 end
 
 ###################################################################################################
+def authMergeKey(name)
+  name.sub(/, (\w)\w$/, ', \1').downcase
+end
+
+###################################################################################################
+# UCSF may supply apparent dupes to us, but each record has one of the authors' email addresses
+# filled in. This code checks that the authors are the same, and fills in the missing email.
+def mergeAuthorInfo(dst, src)
+
+  # We will do 8-character matching, but fall back to 4-character if we can't do that.
+  dst4, dst8 = {}, {}
+  dst.authors.each_with_index { |auth, n| 
+    dstName, dstEmail = auth.split('|')
+    next if dstEmail
+    key = authMergeKey(dstName)
+    dst8[key[0,8]] = n 
+    dst4[key[0,4]] = n
+  }
+
+  campusID = dst.ids.select{|scheme,id| isCampusID(scheme)}[0][1]
+  origStr = "\n  " + dst.authors.map{|auth| auth.split('|')[0]}.sort.join(";\n  ")
+
+  found = false
+  srcWithEmail = nil
+  src.authors.each { |srcAuth|
+    srcName, srcEmail = srcAuth.split('|')
+    next unless srcEmail
+    srcWithEmail = srcAuth
+    key = authMergeKey(srcName)[0,8]
+    if dst8.include? key
+      dst.authors[dst8[key]] = srcAuth
+      found = 8
+    end
+  }
+  if !found
+    src.authors.each { |srcAuth|
+      srcName, srcEmail = srcAuth.split('|')
+      next unless srcEmail
+      key = authMergeKey(srcName)[0,4]
+      if dst4.include? key
+        dst.authors[dst4[key]] = srcAuth
+        found = 4
+      end
+    }
+  end
+
+  if !srcWithEmail
+    # don't care, no email to match anyway
+  elsif !found
+    puts "Warning: In campus pub #{campusID}, unable to match #{srcWithEmail.inspect} to authors: #{origStr}"
+  elsif found == 4
+    puts "Note: In campus pub #{campusID}, less-happy match #{srcWithEmail.inspect} to authors: #{origStr}"
+  else
+    #puts "Matched #{srcWithEmail.inspect} to authors #{origStr} to yield #{dst.authors.map{|auth| auth.split('|')[0]}.join('; ')}"
+  end
+end
+
+###################################################################################################
 def readItems(filename)
   FileUtils::mkdir_p('cache')
   cacheFile = "cache/#{filename}.cache"
@@ -276,7 +334,7 @@ def readItems(filename)
     Zlib::GzipReader.open(cacheFile) { |io| return Marshal.load(io) }
   else
     items = []
-    campusIds = Set.new
+    campusIdToItem = {}
     puts "Reading #{filename}."
     doc = Nokogiri::XML(filename =~ /\.gz$/ ? Zlib::GzipReader.open(filename) : File.open(filename), &:noblanks)
     puts "Parsing."
@@ -289,23 +347,20 @@ def readItems(filename)
       item = parseElemNativeRecord(record.at('native'))
 
       # Identifier parsing
-      dupeCampusID = false
-      gotCampusID = false
+      campusId = nil
       item.ids.each { |scheme, text|
-        if isCampusID(scheme)
-          dupeCampusID ||= campusIds.include?(text)
-          campusIds << text
-          gotCampusID = true
-        end
+        isCampusID(scheme) and campusId = text
       }
       
-      gotCampusID or raise("No campus ID found: #{record}")
+      campusId or raise("No campus ID found: #{record}")
 
-      # Bundle up the result
-      if dupeCampusID
+      # Bundle up the result (or in the case of a dupe merge the author info)
+      if campusIdToItem.include? campusId
         nDupes += 1
+        mergeAuthorInfo(campusIdToItem[campusId], item)
         next
      else
+        campusIdToItem[campusId] = item
         items << item
         #puts item
       end
@@ -313,12 +368,12 @@ def readItems(filename)
       # Give feedback every once in a while.
       nParsed += 1
       if (nParsed % 1000) == 0
-        puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
+        puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes merged)."
         # TODO: For debugging speed, stop after 10000 records. For real production run, take this out!
         #break if nParsed == 10000
       end      
     }
-    puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes skipped)."
+    puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes merged)."
 
     puts "Writing cache file."
     Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump(items, io) }
@@ -620,8 +675,25 @@ def postRelationship(oapID, userPropID)
 end
 
 ###################################################################################################
+def printPub(postNum, pub, oapID)
+    puts
+    puts "Post \##{postNum}:"
+    puts "  User emails: #{pub.userEmails.to_a.join(', ')}"
+    puts "  User ids   : #{pub.userPropIds.to_a.join(', ')}"
+    pub.items.each { |item|
+      idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
+      puts "  #{item.title}"
+      puts "      #{item.date}     #{item.authors.join(', ')}"
+      puts "      #{idStr}"
+    }
+    oapID and puts "  OAP ID: #{oapID}"
+    return true
+end
+
+###################################################################################################
 # Bring this grouped publication into Elements
-def importPub(pub)
+def importPub(postNum, pub)
+  printed = false
 
   # Pick the best item for its metadata
   bestItem = pub.items.inject { |memo, item| isBetterItem(item, memo) ? item : memo }
@@ -639,6 +711,7 @@ def importPub(pub)
 
   # If we can't find one, mint a new one.
   if not oapID
+    printed or printed = printPub(postNum, pub, nil)
     puts "  Minting new OAP ID."
     # Determine the EZID metadata
     idStr = ids.to_a.map { |scheme, id| "#{scheme}::#{id}" }.join(' ')
@@ -647,8 +720,8 @@ def importPub(pub)
              'erc.when' => DateTime.now.iso8601 }
     # And mint the ARK
     oapID = mintOAPID(meta)
+    puts "  OAP ID: #{oapID}"
   end
-  puts "  OAP ID: #{oapID}"
 
   # Associate this OAP identifier with all the item IDs so that in future this group will reliably
   # receive the same identifier.
@@ -666,8 +739,9 @@ def importPub(pub)
   oldHash = $db.get_first_value('SELECT oap_hash FROM oap_hashes WHERE oap_id = ?', oapID)
   isUpdated = false
   if oldHash == newHash
-    puts "  Skip: Existing record is the same."
+    #puts "  Skip: Existing record is the same."
   else
+    printed or printed = printPub(postNum, pub, oapID)
     isJoinedRecord, isElemCompat, elemItem = putRecord(pub, oapID, toPut)
     isUpdated = true
   end
@@ -678,8 +752,9 @@ def importPub(pub)
   oldUsers = Set.new(oldUsers ? oldUsers.split('|') : []) 
   pub.userPropIds.each { |userPropID|
     if oldUsers.include? userPropID
-      puts "  Skip: User #{userPropID} already associated."
+      #puts "  Skip: User #{userPropID} already associated."
     else
+      printed or printed = printPub(postNum, pub, oapID)
       postRelationship(oapID, userPropID)
       anyNewUsers = true
     end
@@ -763,7 +838,8 @@ def main
   }
   puts "Number to post, by id scheme: #{countByCampus}"
 
-  # Print the interesting (i.e. non-singleton) groups
+  # Check and post each group
+  puts "Checking posts."
   postNum = 0
   $pubs.each { |pub|
 
@@ -789,12 +865,12 @@ def main
       item.ids.each { |scheme, id|
         gotEschol ||= (scheme == 'c-eschol-id')
         #gotCampus ||= (scheme =~ /^c-uc\w+-id/)
-        gotCampus ||= (scheme =~ /^c-ucsf-id/)
+        gotCampus ||= (scheme =~ /^c-ucla-id/)
       }
     }
 
     # Deposit only one campus at a time for now
-    next if !gotCampus
+    #next if !gotCampus
 
     if false
       # This block only processes non-eschol items, that are after the main policy date
@@ -807,21 +883,14 @@ def main
       end
     end
 
-    puts
     postNum += 1
-    puts "Post \##{postNum}:"
-    puts "  User emails: #{pub.userEmails.to_a.join(', ')}"
-    puts "  User ids   : #{pub.userPropIds.to_a.join(', ')}"
-    pub.items.each { |item|
-      idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-      puts "  #{item.title}"
-      puts "      #{item.date}     #{item.authors.join(', ')}"
-      puts "      #{idStr}"
-    }
-
-    importPub(pub)
+    importPub(postNum, pub)
+    if (postNum % 1000) == 0
+      puts "Checked #{postNum} posts."
+    end
   }
 
+  puts "Checked #{postNum} posts."
   puts "All done."
 end
 
