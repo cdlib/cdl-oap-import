@@ -7,4 +7,5 @@ oap.db
 *.bak
 Gemfile.lock
 cache/*.cache
+screenlog.*
 trans.log

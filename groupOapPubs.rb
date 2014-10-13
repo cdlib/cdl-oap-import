@@ -42,7 +42,11 @@ $stopwords = Set.new(("a an the of and to in that was his he it with is for as h
                       "from this him but all she they were my are me one their so an said them we who would been will no when").split)
 
 # Structure for holding information on an item
-Item = Struct.new(:title, :docKey, :authors, :date, :ids, :journal, :volume, :issue)
+Item = Struct.new(:title, :docKey, :authors, :date, :ids, :journal, :volume, :issue) {
+  def campusIDs
+    ids.select { |scheme, text| isCampusID(scheme) }
+  end
+}
 
 # Structure for holding a group of duplicate items
 OAPub = Struct.new(:items, :userEmails, :userPropIds)
@@ -287,7 +291,7 @@ def mergeAuthorInfo(dst, src)
     dst4[key[0,4]] = n
   }
 
-  campusID = dst.ids.select{|scheme,id| isCampusID(scheme)}[0][1]
+  campusID = dst.campusIDs[0][1]
   origStr = "\n  " + dst.authors.map{|auth| auth.split('|')[0]}.sort.join(";\n  ")
 
   found = false
@@ -347,11 +351,7 @@ def readItems(filename)
       item = parseElemNativeRecord(record.at('native'))
 
       # Identifier parsing
-      campusId = nil
-      item.ids.each { |scheme, text|
-        isCampusID(scheme) and campusId = text
-      }
-      
+      campusId = item.campusIDs[0]
       campusId or raise("No campus ID found: #{record}")
 
       # Bundle up the result (or in the case of a dupe merge the author info)
@@ -691,6 +691,13 @@ def printPub(postNum, pub, oapID)
 end
 
 ###################################################################################################
+# When a new association between a campus ID and OAP ID occurs, check if it's a possible dupe.
+def checkNewAssoc(scheme, id, oapID)
+  puts "Would check new assoc here."
+  exit 2
+end
+
+###################################################################################################
 # Bring this grouped publication into Elements
 def importPub(postNum, pub)
   printed = false
@@ -700,13 +707,15 @@ def importPub(postNum, pub)
 
   # Combine all the identifiers and remove duplicates
   ids = pub.items.map { |item| item.ids }.flatten(1).uniq
+  campusIDs = pub.items.map { |item| item.campusIDs }.flatten(1).uniq
 
-  # For existing groups, we'll already have an identifier in the database.
+  # For existing groups, we'll already have an identifier in the database. Re-use it.
   oapID = nil
-  ids.each { |scheme, id|
-    if isCampusID(scheme)
-      oapID ||= $db.get_first_value("SELECT oap_id FROM ids WHERE campus_id = ?", "#{scheme}::#{id}")
-    end
+  campusToOAP = Hash.new{|h, k| h[k] = Hash.new }
+  campusIDs.each { |scheme, id|
+    old_oapID = $db.get_first_value("SELECT oap_id FROM ids WHERE campus_id = ?", "#{scheme}::#{id}")
+    campusToOAP[scheme][id] = old_oapID
+    oapID ||= old_oapID
   }
 
   # If we can't find one, mint a new one.
@@ -725,9 +734,20 @@ def importPub(postNum, pub)
 
   # Associate this OAP identifier with all the item IDs so that in future this group will reliably
   # receive the same identifier.
-  ids.each { |scheme, id|
-    if isCampusID(scheme)
-      $db.execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
+  campusIDs.each { |scheme, id|
+    if campusToOAP[scheme] && campusToOAP[scheme][id]
+      if campusToOAP[scheme][id] == oapID
+        # Unchanged association - don't need to update db
+      else
+        puts "Warning: campus ID #{scheme}::#{id} is switching from oapID #{oldIds[[scheme,id]]} to #{oapID}"
+        checkNewAssoc(scheme, id, oapID)
+        $db.execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
+      end
+    else
+      # New association - add it to the db
+      checkNewAssoc(scheme, id, oapID)
+      puts "Inserting new OAP ID."
+      $db.execute("INSERT INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
     end
   }
 
@@ -858,31 +878,7 @@ def main
     # If no user ids, there's no point in uploading the item
     pub.userPropIds or next
 
-    # See all the kinds of ids we got
-    gotEschol = false
-    gotCampus = false
-    pub.items.each { |item|
-      item.ids.each { |scheme, id|
-        gotEschol ||= (scheme == 'c-eschol-id')
-        #gotCampus ||= (scheme =~ /^c-uc\w+-id/)
-        gotCampus ||= (scheme =~ /^c-ucla-id/)
-      }
-    }
-
-    # Deposit only one campus at a time for now
-    #next if !gotCampus
-
-    if false
-      # This block only processes non-eschol items, that are after the main policy date
-      next if gotEschol
-      puts pub.items[0].date
-      begin
-        next if DateTime.strptime(pub.items[0].date, "%F") < DateTime.new(2013,8,1)
-      rescue
-        next
-      end
-    end
-
+    # Post it.
     postNum += 1
     importPub(postNum, pub)
     if (postNum % 1000) == 0

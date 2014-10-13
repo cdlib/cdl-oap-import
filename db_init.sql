@@ -27,7 +27,7 @@ CREATE INDEX pub_id ON pubs(pub_id);
 
 -- Table of hashes and users so we can avoid re-uploading things that are already current
 CREATE TABLE oap_hashes (
-  oap_id        TEXT NOT NULL,
+  oap_id        TEXT PRIMARY KEY NOT NULL,
   updated       DATE,
   oap_hash      TEXT,
   oap_users     TEXT
