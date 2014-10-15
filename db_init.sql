@@ -32,3 +32,11 @@ CREATE TABLE oap_hashes (
   oap_hash      TEXT,
   oap_users     TEXT
 );
+
+-- Table of flags for each OAP ID
+CREATE TABLE oap_flags (
+  oap_id          TEXT PRIMARY KEY NOT NULL,
+  isJoinedRecord  INTEGER,
+  isElemCompat    INTEGER
+);
+

@@ -25,6 +25,9 @@ require 'zlib'
 # Flush stdout after each write
 STDOUT.sync = true
 
+# Special args
+$forceMode = ARGV.delete('--force')
+
 # Global variables
 $allItems = []
 $docKeyToItems = Hash.new{|h, k| h[k] = Array.new }
@@ -572,7 +575,7 @@ def putRecord(pub, oapID, toPut)
 
     # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
     if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
-      puts "  Warning: failed due to #{res} (likely a transitory concurrency issue)."
+      puts "  Note: failed due to #{res} (likely a transitory concurrency issue)."
       if tryNumber < 10
         puts "  Will retry after a 30-second pause."
         sleep 30
@@ -656,7 +659,7 @@ def postRelationship(oapID, userPropID)
 
     # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
     if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
-      puts "  Warning: failed due to #{res} (likely a transitory concurrency issue)."
+      puts "  Note: failed due to #{res} (likely a transitory concurrency issue)."
       if tryNumber < 10
         puts "  Will retry after a 30-second pause."
         sleep 30
@@ -678,8 +681,6 @@ end
 def printPub(postNum, pub, oapID)
     puts
     puts "Post \##{postNum}:"
-    puts "  User emails: #{pub.userEmails.to_a.join(', ')}"
-    puts "  User ids   : #{pub.userPropIds.to_a.join(', ')}"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
       puts "  #{item.title}"
@@ -692,9 +693,16 @@ end
 
 ###################################################################################################
 # When a new association between a campus ID and OAP ID occurs, check if it's a possible dupe.
-def checkNewAssoc(scheme, id, oapID)
-  puts "Would check new assoc here."
-  exit 2
+def checkNewAssoc(scheme, campusID, oapID, campusCache)
+  if campusCache.empty?
+    $db.execute("SELECT campus_id FROM ids WHERE oap_id = ?", [oapID]) { |row|
+      foundScheme, foundID = row[0].split('::')
+      campusCache[scheme] << foundID
+    }
+  end
+  if campusCache[scheme].length > 0 && !campusCache[scheme].include?(campusID)
+    puts "Warning: possible dupe: campus ID #{scheme}::#{campusID} being added to oapID #{oapID} which already had #{campusCache[scheme].to_a.inspect}."
+  end
 end
 
 ###################################################################################################
@@ -734,18 +742,20 @@ def importPub(postNum, pub)
 
   # Associate this OAP identifier with all the item IDs so that in future this group will reliably
   # receive the same identifier.
+  campusCache = Hash.new { |h,k| h[k] = Set.new }
   campusIDs.each { |scheme, id|
     if campusToOAP[scheme] && campusToOAP[scheme][id]
       if campusToOAP[scheme][id] == oapID
+        checkNewAssoc(scheme, id, oapID, campusCache)
         # Unchanged association - don't need to update db
       else
         puts "Warning: campus ID #{scheme}::#{id} is switching from oapID #{oldIds[[scheme,id]]} to #{oapID}"
-        checkNewAssoc(scheme, id, oapID)
+        checkNewAssoc(scheme, id, oapID, campusCache)
         $db.execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
       end
     else
       # New association - add it to the db
-      checkNewAssoc(scheme, id, oapID)
+      checkNewAssoc(scheme, id, oapID, campusCache)
       puts "Inserting new OAP ID."
       $db.execute("INSERT INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
     end
@@ -758,11 +768,13 @@ def importPub(postNum, pub)
   newHash = Digest::SHA1.hexdigest toPut
   oldHash = $db.get_first_value('SELECT oap_hash FROM oap_hashes WHERE oap_id = ?', oapID)
   isUpdated = false
-  if oldHash == newHash
+  if !$forceMode && (oldHash == newHash)
     #puts "  Skip: Existing record is the same."
   else
     printed or printed = printPub(postNum, pub, oapID)
     isJoinedRecord, isElemCompat, elemItem = putRecord(pub, oapID, toPut)
+    $db.execute('INSERT OR REPLACE INTO oap_flags (oap_id, isJoinedRecord, isElemCompat) VALUES (?, ?, ?)',
+      [oapID, isJoinedRecord ? 1 : 0, isElemCompat ? 1 : 0])
     isUpdated = true
   end
 
@@ -771,7 +783,7 @@ def importPub(postNum, pub)
   oldUsers = $db.get_first_value('SELECT oap_users FROM oap_hashes WHERE oap_id = ?', oapID)
   oldUsers = Set.new(oldUsers ? oldUsers.split('|') : []) 
   pub.userPropIds.each { |userPropID|
-    if oldUsers.include? userPropID
+    if !$forceMode && oldUsers.include?(userPropID)
       #puts "  Skip: User #{userPropID} already associated."
     else
       printed or printed = printPub(postNum, pub, oapID)
@@ -877,6 +889,9 @@ def main
 
     # If no user ids, there's no point in uploading the item
     pub.userPropIds or next
+
+    ##Hack to skip all but UCI this time
+    #next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == 'c-uci-id' }}
 
     # Post it.
     postNum += 1
