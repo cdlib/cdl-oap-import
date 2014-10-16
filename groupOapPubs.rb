@@ -576,7 +576,7 @@ def putRecord(pub, oapID, toPut)
     # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
     if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
       puts "  Note: failed due to #{res} (likely a transitory concurrency issue)."
-      if tryNumber < 10
+      if tryNumber < 20
         puts "  Will retry after a 30-second pause."
         sleep 30
         next
@@ -660,7 +660,7 @@ def postRelationship(oapID, userPropID)
     # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
     if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
       puts "  Note: failed due to #{res} (likely a transitory concurrency issue)."
-      if tryNumber < 10
+      if tryNumber < 20
         puts "  Will retry after a 30-second pause."
         sleep 30
         next
