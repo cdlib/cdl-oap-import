@@ -56,8 +56,8 @@ OAPub = Struct.new(:items, :userEmails, :userPropIds)
 
 ###################################################################################################
 # Determine the Elements API instance to connect to, based on the host name
-hostname = `/bin/hostname`.strip
-$elementsAPI = case hostname
+$hostname = `/bin/hostname`.strip
+$elementsAPI = case $hostname
   when 'submit-stg', 'submit-dev'; 'https://qa-oapolicy.universityofcalifornia.edu:8002/elements-secure-api'
   when 'cdl-submit-p01'; 'https://oapolicy.universityofcalifornia.edu:8002/elements-secure-api'
   else 'http://unknown-host/elements-secure-api'
@@ -749,7 +749,7 @@ def importPub(postNum, pub)
         checkNewAssoc(scheme, id, oapID, campusCache)
         # Unchanged association - don't need to update db
       else
-        puts "Warning: campus ID #{scheme}::#{id} is switching from oapID #{oldIds[[scheme,id]]} to #{oapID}"
+        puts "Warning: campus ID #{scheme}::#{id} is switching from oapID #{campusToOAP[scheme][id]} to #{oapID}"
         checkNewAssoc(scheme, id, oapID, campusCache)
         $db.execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
       end
@@ -822,7 +822,12 @@ def main
   # We'll need credentials for talking to EZID
   (ezidCred = Netrc.read['ezid.cdlib.org']) or raise("Need credentials for ezid.cdlib.org in ~/.netrc")
   puts "Starting EZID session."
-  $ezidSession = Ezid::ApiSession.new(ezidCred[0], ezidCred[1], :ark, '99999/fk4', 'https://ezid.cdlib.org')
+  shoulder = case $hostname
+    when 'submit-stg', 'submit-dev'; '99999/fk4'
+    when 'cdl-submit-p01'; '13030/p4'
+    else 'http://unknown-host/elements-secure-api'
+  end
+  $ezidSession = Ezid::ApiSession.new(ezidCred[0], ezidCred[1], :ark, shoulder, 'https://ezid.cdlib.org')
   #puts "Minting an ARK."
   #puts mintOAPID({'erc.who' => 'eScholarship harvester',
   #                'erc.what' => 'A test OAP identifier',
@@ -890,8 +895,8 @@ def main
     # If no user ids, there's no point in uploading the item
     pub.userPropIds or next
 
-    ##Hack to skip all but UCI this time
-    #next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == 'c-uci-id' }}
+    #Hack to skip all but UCSF this time
+    next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == 'c-ucsf-id' }}
 
     # Post it.
     postNum += 1
