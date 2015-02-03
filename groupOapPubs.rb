@@ -28,6 +28,13 @@ STDOUT.sync = true
 # Special args
 $forceMode = ARGV.delete('--force')
 
+if ARGV.include? '--only'
+  pos = ARGV.index '--only'
+  ARGV.delete_at pos
+  $onlyCampus = ARGV[pos]
+  ARGV.delete_at pos
+end
+
 # Global variables
 $allItems = []
 $docKeyToItems = Hash.new{|h, k| h[k] = Array.new }
@@ -352,6 +359,13 @@ def readItems(filename)
     doc.xpath('records/*').each { |record|
       record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
       item = parseElemNativeRecord(record.at('native'))
+
+      # A few records have no title. We can't do anything with them.
+      if item.title == nil || item.title.length == 0
+        idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
+        puts "Warning: item with empty title: #{idStr} ... skipped."
+        next
+      end
 
       # Identifier parsing
       campusId = item.campusIDs[0]
@@ -697,11 +711,13 @@ def checkNewAssoc(scheme, campusID, oapID, campusCache)
   if campusCache.empty?
     $db.execute("SELECT campus_id FROM ids WHERE oap_id = ?", [oapID]) { |row|
       foundScheme, foundID = row[0].split('::')
-      campusCache[scheme] << foundID
+      campusCache[foundScheme] << foundID
     }
   end
   if campusCache[scheme].length > 0 && !campusCache[scheme].include?(campusID)
     puts "Warning: possible dupe: campus ID #{scheme}::#{campusID} being added to oapID #{oapID} which already had #{campusCache[scheme].to_a.inspect}."
+    puts "campusCache=#{campusCache.inspect}"
+    exit 1
   end
 end
 
@@ -756,7 +772,7 @@ def importPub(postNum, pub)
     else
       # New association - add it to the db
       checkNewAssoc(scheme, id, oapID, campusCache)
-      puts "Inserting new OAP ID."
+      #puts "  Inserting new OAP ID."
       $db.execute("INSERT INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
     end
   }
@@ -895,8 +911,10 @@ def main
     # If no user ids, there's no point in uploading the item
     pub.userPropIds or next
 
-    #Hack to skip all but UCSF this time
-    next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == 'c-ucsf-id' }}
+    # If only doing one campus, skip everything else.
+    if $onlyCampus
+      next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == "c-#{$onlyCampus}-id" }}
+    end
 
     # Post it.
     postNum += 1

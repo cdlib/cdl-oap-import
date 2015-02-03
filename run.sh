@@ -1,3 +1,7 @@
 #!/usr/bin/env bash
 
-bundle exec ruby updateUserIDs.rb hr_feed.xml && bundle exec ruby groupOapPubs.rb uc*.xml* eschol.xml.gz $*
+set -e
+echo "Updating user IDs."
+bundle exec ruby updateUserIDs.rb hr_feed.xml
+echo "Importing publications."
+bundle exec ruby groupOapPubs.rb uc*.xml* eschol.xml* $*
