@@ -47,16 +47,25 @@ $db = SQLite3::Database.new("oap.db")
 $db.busy_timeout = 30000
 $transLog = nil
 
+# Elements type IDs
+$typeIds = { 2 => 'book',
+             3 => 'chapter',
+             4 => 'conference',
+             5 => 'article' }
+
 # Common English stop-words
 $stopwords = Set.new(("a an the of and to in that was his he it with is for as had you not be her on at by which have or " +
                       "from this him but all she they were my are me one their so an said them we who would been will no when").split)
 
 # Structure for holding information on an item
-Item = Struct.new(:title, :docKey, :authors, :date, :ids, :journal, :volume, :issue) {
+Item = Struct.new(:typeId, :title, :docKey, :authors, :date, :ids, :journal, :volume, :issue, :otherInfo) {
   def campusIDs
     ids.select { |scheme, text| isCampusID(scheme) }
   end
 }
+
+# Less common item info (only for books, conferences, etc.)
+OtherItemInfo = Struct.new(:abstract, :editors, :publisher, :placeOfPublication, :pagination, :nameOfConference)
 
 # Structure for holding a group of duplicate items
 OAPub = Struct.new(:items, :userEmails, :userPropIds)
@@ -202,6 +211,14 @@ def isCompatible(items, cand)
   ok = true
   ids = {}
 
+  # Make sure the candidate has same type-id
+  items.each { |item|
+    if item.typeId != cand.typeId
+      #puts "Type-id mismatch for scheme #{scheme.inspect}: #{cand.typeId.inspect} vs #{item.typeId.inspect}"
+      ok = false
+    end
+  }
+
   # Make sure the candidate overlaps at least one author of every pub in the set
   items.each { |item|
     itemAuthKeys = $authKeys[item]
@@ -230,7 +247,10 @@ def isCompatible(items, cand)
 end
 
 ###################################################################################################
-def parseElemNativeRecord(native)
+def parseElemNativeRecord(native, typeId)
+
+  # Make sure the type ID is valid
+  $typeIds[typeId] or raise("Unknown type-id #{typeId}")
 
   # Title parsing and doc key generation
   title = normalize(native.text_at("field[@name='title']/text"))
@@ -277,8 +297,36 @@ def parseElemNativeRecord(native)
   volume  = native.text_at("field[@name='volume']/text")
   issue   = native.text_at("field[@name='issue']/text")
 
+  # Other info (not present for most items, since most are journal articles)
+  other = OtherItemInfo.new
+  other.abstract = native.text_at("field[@name='abstract']/text")
+  other.publisher = native.text_at("field[@name='publisher']/text")
+  other.placeOfPublication = native.text_at("field[@name='place-of-publication']/text")
+  other.nameOfConference = native.text_at("field[@name='name-of-conference']/text")
+
+  if native.text_at("field[@name='editors']//person/last-name") && native.text_at("field[@name='editors']//person/last-name").length > 0
+    other.editors = native.xpath("field[@name='editors']//person").map { |person|
+      lname = normalize(person.text_at('last-name'))
+      initials = normalize(person.text_at('initials'))
+      email = normalize(person.text_at('email-address'))
+      "#{lname}, #{initials}|#{email}"
+    }
+  end
+
+  if native.at("field[@pagination]/text")
+    str = native.text_at("field[@pagination]/text").strip
+    if str =~ /(\d+)\s*-\s*(\d+)/
+      firstPage = $1
+      lastPage = $2
+      if lastPage.length < firstPage.length   # handle "213-23"
+        lastPage = firstPage[0, firstPage.length - lastPage.length] + lastPage
+      end
+      other.pagination = [firstPage, lastPage]
+    end
+  end
+
   # Bundle up the result
-  return Item.new(title, docKey, authors, date, ids, journal, volume, issue)
+  return Item.new(typeId, title, docKey, authors, date, ids, journal, volume, issue, (other.select{|v| v}.empty?) ? nil : other)
 end
 
 ###################################################################################################
@@ -358,7 +406,7 @@ def readItems(filename)
     nTotal = doc.xpath('records/*').length
     doc.xpath('records/*').each { |record|
       record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
-      item = parseElemNativeRecord(record.at('native'))
+      item = parseElemNativeRecord(record.at('native'), record.attr('type-id').to_i)
 
       # A few records have no title. We can't do anything with them.
       if item.title == nil || item.title.length == 0
@@ -489,27 +537,30 @@ def isBetterItem(item1, item2)
 end
 
 ###################################################################################################
+def peopleToXML(xml, people)
+  xml.people {
+    people.each { |auth|
+      xml.person {
+        name, email = auth.split("|")
+        last, initials = name.split(", ")
+        xml.send('last-name', last)
+        xml.initials(initials)
+        email and email.strip != '' and xml.send('email-address', email)
+      }
+    }
+  }
+end
+
+###################################################################################################
 def makeRecordToPut(item, dedupedIds)
   Nokogiri::XML::Builder.new { |xml|
     xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api", 
-            'type-id' => '5') { # 5 = journal-article
+            'type-id' => item.typeId) { # 2 = book, 3 = chapter, 4 = conference, 5 = journal-article
       xml.native {
 
         # Title, author, journal/vol/iss, and date all taken from a single item chosen as the "best"
         xml.field(name: 'title') { xml.text_ item.title }
-        xml.field(name: 'authors') {
-          xml.people {
-            item.authors.each { |auth|
-              xml.person {
-                name, email = auth.split("|")
-                last, initials = name.split(", ")
-                xml.send('last-name', last)
-                xml.initials(initials)
-                email and email.strip != '' and xml.send('email-address', email)
-              }
-            }
-          }
-        }
+        xml.field(name: 'authors') { peopleToXML(xml, item.authors) }
         item.journal and xml.field(name: 'journal') { xml.text_ item.journal }
         item.volume and xml.field(name: 'volume') { xml.text_ item.volume }
         item.issue and xml.field(name: 'issue') { xml.text_ item.issue }
@@ -551,6 +602,24 @@ def makeRecordToPut(item, dedupedIds)
               }
             }
           }
+        end
+
+        # Less common info (e.g. for books, conferences)
+        other = item.otherInfo
+        if other
+          other.abstract and xml.field(name: 'abstract') { xml.text_ other.abstract }
+          other.editors and xml.field(name: 'editors') { peopleToXML(xml, other.editors) }
+          other.publisher and xml.field(name: 'publisher') { xml.text_ other.publisher }
+          other.placeOfPublication and xml.field(name: 'place-of-publication') { xml.text_ other.placeOfPublication }
+          other.nameOfConference and xml.field(name: 'name-of-conference') { xml.text_ other.nameOfConference }
+          if other.pagination
+            xml.field(name: 'pagination') {
+              xml.pagination {
+                xml.send('begin-page', other.pagination[0])
+                xml.send('end-page', other.pagination[1])
+              }
+            }
+          end
         end
       }
     }
@@ -624,7 +693,7 @@ def putRecord(pub, oapID, toPut)
       native = obj.at("records/record[@format='native'][source-name='scopus']")
       native or native = obj.at("records/record[@format='native'][source-name='crossref']")
       native or native = otherRecords[0]
-      elemItem = parseElemNativeRecord(native.at('native'))
+      elemItem = parseElemNativeRecord(native.at('native'), obj.attr('type-id').to_i)
       isElemCompat = isCompatible(pub.items, elemItem)
     end
 
@@ -697,7 +766,7 @@ def printPub(postNum, pub, oapID)
     puts "Post \##{postNum}:"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-      puts "  #{item.title}"
+      puts "  #{item.title} [#{$typeIds[item.typeId]}]"
       puts "      #{item.date}     #{item.authors.join(', ')}"
       puts "      #{idStr}"
     }
@@ -716,8 +785,6 @@ def checkNewAssoc(scheme, campusID, oapID, campusCache)
   end
   if campusCache[scheme].length > 0 && !campusCache[scheme].include?(campusID)
     puts "Warning: possible dupe: campus ID #{scheme}::#{campusID} being added to oapID #{oapID} which already had #{campusCache[scheme].to_a.inspect}."
-    puts "campusCache=#{campusCache.inspect}"
-    exit 1
   end
 end
 
