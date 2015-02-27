@@ -27,6 +27,7 @@ STDOUT.sync = true
 
 # Special args
 $forceMode = ARGV.delete('--force')
+$reportMode = ARGV.delete('--report')
 
 if ARGV.include? '--only'
   pos = ARGV.index '--only'
@@ -46,6 +47,10 @@ $credentials = nil
 $db = SQLite3::Database.new("oap.db")
 $db.busy_timeout = 30000
 $transLog = nil
+$toPost = nil
+$reportFile = nil
+
+ALL_CAMPUSES = ['eschol', 'ucla', 'uci', 'ucsf']
 
 # Elements type IDs
 $typeIds = { 2 => 'book',
@@ -65,7 +70,7 @@ Item = Struct.new(:typeId, :title, :docKey, :authors, :date, :ids, :journal, :vo
 }
 
 # Less common item info (only for books, conferences, etc.)
-OtherItemInfo = Struct.new(:abstract, :editors, :publisher, :placeOfPublication, :pagination, :nameOfConference)
+OtherItemInfo = Struct.new(:abstract, :editors, :publisher, :placeOfPublication, :pagination, :nameOfConference, :parentTitle)
 
 # Structure for holding a group of duplicate items
 OAPub = Struct.new(:items, :userEmails, :userPropIds)
@@ -73,11 +78,12 @@ OAPub = Struct.new(:items, :userEmails, :userPropIds)
 ###################################################################################################
 # Determine the Elements API instance to connect to, based on the host name
 $hostname = `/bin/hostname`.strip
-$elementsAPI = case $hostname
-  when 'submit-stg', 'submit-dev'; 'https://qa-oapolicy.universityofcalifornia.edu:8002/elements-secure-api'
-  when 'cdl-submit-p01'; 'https://oapolicy.universityofcalifornia.edu:8002/elements-secure-api'
-  else 'http://unknown-host/elements-secure-api'
+$elementsUI = case $hostname
+  when 'submit-stg', 'submit-dev'; 'https://qa-oapolicy.universityofcalifornia.edu'
+  when 'cdl-submit-p01'; 'https://oapolicy.universityofcalifornia.edu'
+  else 'http://unknown-host'
 end
+$elementsAPI = "#{$elementsUI}:8002/elements-secure-api"
 
 # We need to identify recurring series items and avoid grouping them. Best way seems to be just by title.
 seriesTitles = [
@@ -249,9 +255,6 @@ end
 ###################################################################################################
 def parseElemNativeRecord(native, typeId)
 
-  # Make sure the type ID is valid
-  $typeIds[typeId] or raise("Unknown type-id #{typeId}")
-
   # Title parsing and doc key generation
   title = normalize(native.text_at("field[@name='title']/text"))
   docKey = filterTitle(title).join(' ')
@@ -277,7 +280,7 @@ def parseElemNativeRecord(native, typeId)
 
   # Identifier parsing
   ids = []
-  ['eschol', 'ucla', 'uci', 'ucsf'].each { |campus|
+  ALL_CAMPUSES.each { |campus|
     tmp = native.text_at("field[@name='c-#{campus}-id']/text")
     tmp and ids << ["c-#{campus}-id", normalizeIdentifier(tmp)]
   }
@@ -303,6 +306,7 @@ def parseElemNativeRecord(native, typeId)
   other.publisher = native.text_at("field[@name='publisher']/text")
   other.placeOfPublication = native.text_at("field[@name='place-of-publication']/text")
   other.nameOfConference = native.text_at("field[@name='name-of-conference']/text")
+  other.parentTitle = native.text_at("field[@name='parent-title']/text")
 
   if native.text_at("field[@name='editors']//person/last-name") && native.text_at("field[@name='editors']//person/last-name").length > 0
     other.editors = native.xpath("field[@name='editors']//person").map { |person|
@@ -406,7 +410,9 @@ def readItems(filename)
     nTotal = doc.xpath('records/*').length
     doc.xpath('records/*').each { |record|
       record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
-      item = parseElemNativeRecord(record.at('native'), record.attr('type-id').to_i)
+      typeId = record.attr('type-id').to_i
+      $typeIds[typeId] or raise("Unknown type-id #{typeId}")
+      item = parseElemNativeRecord(record.at('native'), typeId)
 
       # A few records have no title. We can't do anything with them.
       if item.title == nil || item.title.length == 0
@@ -527,7 +533,11 @@ end
 ###################################################################################################
 def makeItemStr(item)
   title = normalize(item.title)
-  date = item.date.gsub("-01", "-1").gsub("-00", "-")  # penalize less-exact dates
+  if item.date
+    date = item.date.gsub("-01", "-1").gsub("-00", "-")  # penalize less-exact dates
+  else
+    date = "nil"
+  end
   authors = item.authors.map { |auth| auth.split("|")[0] }.join(';')
   str = "#{title}|#{date}|#{authors}|#{item.journal}|#{item.volume}|#{item.issue}"
   return str
@@ -612,6 +622,7 @@ def makeRecordToPut(item, dedupedIds)
           other.publisher and xml.field(name: 'publisher') { xml.text_ other.publisher }
           other.placeOfPublication and xml.field(name: 'place-of-publication') { xml.text_ other.placeOfPublication }
           other.nameOfConference and xml.field(name: 'name-of-conference') { xml.text_ other.nameOfConference }
+          other.parentTitle and xml.field(name: 'parent-title') { xml.text_ other.parentTitle }
           if other.pagination
             xml.field(name: 'pagination') {
               xml.pagination {
@@ -697,9 +708,6 @@ def putRecord(pub, oapID, toPut)
       isElemCompat = isCompatible(pub.items, elemItem)
     end
 
-    # Give Elements a second to cool off and serve other queries.
-    #sleep 0.5
-
     # And we're done.
     return isJoinedRecord, isElemCompat, elemItem
   }
@@ -763,15 +771,62 @@ end
 ###################################################################################################
 def printPub(postNum, pub, oapID)
     puts
-    puts "Post \##{postNum}:"
+    puts "Post \##{postNum} of #{$toPost.size}:"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
       puts "  #{item.title} [#{$typeIds[item.typeId]}]"
-      puts "      #{item.date}     #{item.authors.join(', ')}"
+      puts "      #{item.date ? item.date : '<no date>'}     #{item.authors.join('; ').gsub('|;', ';')}"
       puts "      #{idStr}"
     }
     oapID and puts "  OAP ID: #{oapID}"
     return true
+end
+
+###################################################################################################
+def genReportHeader()
+  str = "OAP ID\t" +
+        "Pub ID\t" +
+        "Type\t" +
+        "Elements URL\t" +
+        "Join\t" +
+        "Compat\t" +
+        "Date\t" +
+        "Title\t" +
+        "Authors\t"
+  ALL_CAMPUSES.each { |campus|
+    str += "#{campus} IDs\t"
+  }
+  $reportFile.puts(str)
+end
+
+###################################################################################################
+def addToReport(pub, oapID, bestItem)
+  isJoinedRecord = $db.get_first_value("SELECT isJoinedRecord FROM oap_flags WHERE oap_id = ?", oapID).to_i
+  isElemCompat = $db.get_first_value("SELECT isElemCompat FROM oap_flags WHERE oap_id = ?", oapID).to_i
+  pubID = $db.get_first_value("SELECT pub_id FROM pubs WHERE oap_id = ?", oapID)
+
+  str = "#{oapID}\t" +
+        "#{pubID}\t" +
+        "#{$typeIds[bestItem.typeId]}\t" +
+        "#{$elementsUI}/viewobject.html?id=#{pubID}&cid=1\t" +
+        "#{isJoinedRecord == 1 ? 'existing' : 'new'}\t" +
+        "#{isJoinedRecord == 1 ? isElemCompat : ''}\t" +
+        "#{bestItem.date}\t" +
+        "#{bestItem.title.inspect}\t" +
+        "#{bestItem.authors.join('; ').gsub('|;', ';')}\t"
+  campusMap = Hash.new { |h,k| h[k] = Array.new }
+  pub.items.map { |item| item.campusIDs }.flatten(1).uniq.each { |scheme, id|
+    campusMap[scheme] << id
+  }
+  ALL_CAMPUSES.each { |campus|
+    scheme = "c-#{campus}-id"
+    if campusMap.include?(scheme)
+      str += campusMap[scheme].join(', ')
+    end
+    str += "\t"
+  }
+
+  $reportFile.puts(str)
 end
 
 ###################################################################################################
@@ -882,6 +937,11 @@ def importPub(postNum, pub)
       [oapID, DateTime.now.iso8601, newHash, pub.userPropIds.to_a.join('|')])
   end
 
+  # Reporting
+  if $reportMode
+    addToReport(pub, oapID, bestItem)
+  end
+
   # For testing, stop on first non-joined or non-compat record
   if isUpdated
     if isJoinedRecord && !isElemCompat
@@ -958,11 +1018,9 @@ def main
   }
   puts "Number to post, by id scheme: #{countByCampus}"
 
-  # Check and post each group
-  puts "Checking posts."
-  postNum = 0
+  puts "Counting total to check this run."
+  $toPost = []
   $pubs.each { |pub|
-
     # Match email addresses to Elements users
     pub.items.each { |item|
       item.authors.each { |author|
@@ -983,6 +1041,20 @@ def main
       next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == "c-#{$onlyCampus}-id" }}
     end
 
+    $toPost << pub
+  }
+
+  # In report more, generate a report CSV file
+  if $reportMode
+    puts "Creating report.csv."
+    $reportFile = open("report.csv", "w:utf-8")
+    genReportHeader
+  end
+
+  # Check and post each group
+  puts "Checking #{$toPost.size} posts."
+  postNum = 0
+  $toPost.each { |pub|
     # Post it.
     postNum += 1
     importPub(postNum, pub)
@@ -990,6 +1062,9 @@ def main
       puts "Checked #{postNum} posts."
     end
   }
+
+  # Finish off report (in report mode)
+  $reportMode and $reportFile.close
 
   puts "Checked #{postNum} posts."
   puts "All done."
