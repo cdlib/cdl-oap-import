@@ -20,6 +20,7 @@ require 'nokogiri'
 require 'ostruct'
 require 'set'
 require 'sqlite3'
+require 'thread'
 require 'zlib'
 
 # Flush stdout after each write
@@ -46,9 +47,12 @@ $emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
 $credentials = nil
 $db = SQLite3::Database.new("oap.db")
 $db.busy_timeout = 30000
+$dbMutex = Mutex.new
 $transLog = nil
 $toPost = nil
 $reportFile = nil
+$mintQueue = SizedQueue.new(100)
+$importQueue = SizedQueue.new(100)
 
 ALL_CAMPUSES = ['eschol', 'ucla', 'uci', 'ucsf']
 
@@ -74,6 +78,14 @@ OtherItemInfo = Struct.new(:abstract, :editors, :publisher, :placeOfPublication,
 
 # Structure for holding a group of duplicate items
 OAPub = Struct.new(:items, :userEmails, :userPropIds)
+
+# Make puts thread-safe
+$stdoutMutex = Mutex.new
+def puts(*args)
+  $stdoutMutex.synchronize {
+    super(*args)
+  }
+end
 
 ###################################################################################################
 # Determine the Elements API instance to connect to, based on the host name
@@ -158,8 +170,8 @@ end
 # Convert to lower case, remove HTML-like elements, strip out weird characters, normalize spaces.
 def normalize(str)
   str or return ''
-  tmp = transliterate(str)
-  tmp = tmp.gsub(/&lt[;,]/, '<').gsub(/&gt[;,]/, '>').gsub(/&#?\w+[;,]/, '')
+  # NO: tmp = transliterate(str)  # This is dangerous: strips out accents in titles and author names!
+  tmp = str.gsub(/&lt[;,]/, '<').gsub(/&gt[;,]/, '>').gsub(/&#?\w+[;,]/, '')
   tmp = tmp.gsub(/<[^>]+>/, ' ').gsub(/\\n/, ' ')
   tmp = tmp.gsub(/[|]/, '')
   tmp = tmp.gsub(/\s\s+/,' ').strip
@@ -179,20 +191,20 @@ end
 ###################################################################################################
 # Special normalization for ERC metadata
 def normalizeERC(str)
-  return normalize(str).encode('ascii', {:replace => '.'})
+  return transliterate(normalize(str)).encode('ascii', {:replace => '.'})
 end
 
 ###################################################################################################
 # Title-specific normalization
 def filterTitle(title)
   # Break it into words, and remove the stop words.
-  normalize(title).downcase.gsub(/[^a-z0-9 ]/, '').split.select { |w| !$stopwords.include?(w) }
+  transliterate(normalize(title)).downcase.gsub(/[^a-z0-9 ]/, '').split.select { |w| !$stopwords.include?(w) }
 end
 
 ###################################################################################################
 def calcAuthorKeys(item)
   Set.new(item.authors.map { |auth|
-    normalize(auth).downcase.gsub(/[^a-z]/,'')[0,4]
+    transliterate(normalize(auth)).downcase.gsub(/[^a-z]/,'')[0,4]
   })
 end  
 
@@ -200,7 +212,7 @@ end
 # Determine if the title is a likely series item
 def isSeriesTitle(title)
   $titleCount[title] == 1 and return false
-  ft = title.downcase.gsub(/^[\[\(]|[\)\]]$/, '').gsub(/\s\s+/, ' ').gsub('’', '\'').strip()
+  ft = transliterate(title).downcase.gsub(/^[\[\(]|[\)\]]$/, '').gsub(/\s\s+/, ' ').gsub('’', '\'').strip()
   return $seriesTitlesPat.match(ft)
 end
 
@@ -392,6 +404,26 @@ def mergeAuthorInfo(dst, src)
 end
 
 ###################################################################################################
+def iterateRecords(filename)
+  io = (filename =~ /\.gz$/) ? Zlib::GzipReader.open(filename) : File.open(filename)
+  buf = []
+  io.each { |line|
+    if line =~ /<import-record /
+      buf = [line]
+    elsif line =~ /<\/import-record/
+      buf << line
+      str = buf.join("")
+      doc = Nokogiri::XML(str, nil, 'utf-8')
+      doc.remove_namespaces!
+      yield doc.root
+    else
+      buf << line
+    end
+  }
+  io.close
+end
+
+###################################################################################################
 def readItems(filename)
   FileUtils::mkdir_p('cache')
   cacheFile = "cache/#{filename}.cache"
@@ -401,14 +433,10 @@ def readItems(filename)
   else
     items = []
     campusIdToItem = {}
-    puts "Reading #{filename}."
-    doc = Nokogiri::XML(filename =~ /\.gz$/ ? Zlib::GzipReader.open(filename) : File.open(filename), &:noblanks)
-    puts "Parsing."
-    doc.remove_namespaces!
+    puts "Reading and parsing #{filename}."
     nParsed = 0
     nDupes = 0
-    nTotal = doc.xpath('records/*').length
-    doc.xpath('records/*').each { |record|
+    iterateRecords(filename) { |record|
       record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
       typeId = record.attr('type-id').to_i
       $typeIds[typeId] or raise("Unknown type-id #{typeId}")
@@ -439,12 +467,12 @@ def readItems(filename)
       # Give feedback every once in a while.
       nParsed += 1
       if (nParsed % 1000) == 0
-        puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes merged)."
+        puts "...#{nParsed} parsed (#{nDupes} dupes merged)."
         # TODO: For debugging speed, stop after 10000 records. For real production run, take this out!
         #break if nParsed == 10000
       end      
     }
-    puts "...#{nParsed} of #{nTotal} parsed (#{nDupes} dupes merged)."
+    puts "...#{nParsed} parsed (#{nDupes} dupes merged)."
 
     puts "Writing cache file."
     Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump(items, io) }
@@ -462,8 +490,22 @@ def addItems(items)
 end
 
 ###################################################################################################
+def db_get_first_value(stmt, *more)
+  $dbMutex.synchronize {
+    return $db.get_first_value(stmt, *more)
+  }
+end
+
+###################################################################################################
+def db_execute(stmt, *more)
+  $dbMutex.synchronize {
+    return $db.execute(stmt, *more)
+  }
+end
+
+###################################################################################################
 def lookupElementsUser(email)
-  return $db.get_first_value("SELECT proprietary_id FROM emails WHERE email = ?", email)
+  return db_get_first_value("SELECT proprietary_id FROM emails WHERE email = ?", email)
 end
 
 ###################################################################################################
@@ -518,16 +560,6 @@ def mintOAPID(metadata)
   resp = $ezidSession.mint(metadata)
   resp.respond_to?(:errored?) and resp.errored? and raise("Error minting ark: #{resp.response}")
   return resp.identifier
-end
-
-###################################################################################################
-# Normalize both strings, and return the longer one.
-def longerOf(str1, str2)
-  return str1 if !str2
-  return str2 if !str1
-  str1 = normalize(str1)
-  str2 = normalize(str2)
-  return (str1.length >= str2.length) ? str1 : str2
 end
 
 ###################################################################################################
@@ -686,7 +718,7 @@ def putRecord(pub, oapID, toPut)
     putResult = Nokogiri::XML(res.body, &:noblanks)
     putResult.remove_namespaces!
     pubID = putResult.at("entry/object[@category='publication']")['id']
-    $db.execute("INSERT OR REPLACE INTO pubs (pub_id, oap_id) VALUES (?, ?)", [pubID, oapID])
+    db_execute("INSERT OR REPLACE INTO pubs (pub_id, oap_id) VALUES (?, ?)", [pubID, oapID])
 
     # We want to know if Elements created a new record or joined to an existing one. We can tell
     # by checking if there are any other sources.
@@ -801,9 +833,9 @@ end
 
 ###################################################################################################
 def addToReport(pub, oapID, bestItem)
-  isJoinedRecord = $db.get_first_value("SELECT isJoinedRecord FROM oap_flags WHERE oap_id = ?", oapID).to_i
-  isElemCompat = $db.get_first_value("SELECT isElemCompat FROM oap_flags WHERE oap_id = ?", oapID).to_i
-  pubID = $db.get_first_value("SELECT pub_id FROM pubs WHERE oap_id = ?", oapID)
+  isJoinedRecord = db_get_first_value("SELECT isJoinedRecord FROM oap_flags WHERE oap_id = ?", oapID).to_i
+  isElemCompat = db_get_first_value("SELECT isElemCompat FROM oap_flags WHERE oap_id = ?", oapID).to_i
+  pubID = db_get_first_value("SELECT pub_id FROM pubs WHERE oap_id = ?", oapID)
 
   str = "#{oapID}\t" +
         "#{pubID}\t" +
@@ -833,7 +865,7 @@ end
 # When a new association between a campus ID and OAP ID occurs, check if it's a possible dupe.
 def checkNewAssoc(scheme, campusID, oapID, campusCache)
   if campusCache.empty?
-    $db.execute("SELECT campus_id FROM ids WHERE oap_id = ?", [oapID]) { |row|
+    db_execute("SELECT campus_id FROM ids WHERE oap_id = ?", [oapID]) { |row|
       foundScheme, foundID = row[0].split('::')
       campusCache[foundScheme] << foundID
     }
@@ -844,9 +876,8 @@ def checkNewAssoc(scheme, campusID, oapID, campusCache)
 end
 
 ###################################################################################################
-# Bring this grouped publication into Elements
-def importPub(postNum, pub)
-  printed = false
+# Generate an OAP ID for this publication, then queue it for import.
+def mintPub(postNum, pub)
 
   # Pick the best item for its metadata
   bestItem = pub.items.inject { |memo, item| isBetterItem(item, memo) ? item : memo }
@@ -859,23 +890,21 @@ def importPub(postNum, pub)
   oapID = nil
   campusToOAP = Hash.new{|h, k| h[k] = Hash.new }
   campusIDs.each { |scheme, id|
-    old_oapID = $db.get_first_value("SELECT oap_id FROM ids WHERE campus_id = ?", "#{scheme}::#{id}")
+    old_oapID = db_get_first_value("SELECT oap_id FROM ids WHERE campus_id = ?", "#{scheme}::#{id}")
     campusToOAP[scheme][id] = old_oapID
     oapID ||= old_oapID
   }
 
   # If we can't find one, mint a new one.
   if not oapID
-    printed or printed = printPub(postNum, pub, nil)
-    puts "  Minting new OAP ID."
-    # Determine the EZID metadata
     idStr = ids.to_a.map { |scheme, id| "#{scheme}::#{id}" }.join(' ')
+    puts "[Minting new OAP ID for upcoming post #{postNum}]"
+    # Determine the EZID metadata
     meta = { 'erc.what' => normalizeERC("Grouped OA Publication record for '#{bestItem.title}' [IDs #{idStr}]"),
              'erc.who'  => normalizeERC(bestItem.authors.map { |auth| auth.split("|")[0] }.join('; ')),
              'erc.when' => DateTime.now.iso8601 }
     # And mint the ARK
     oapID = mintOAPID(meta)
-    puts "  OAP ID: #{oapID}"
   end
 
   # Associate this OAP identifier with all the item IDs so that in future this group will reliably
@@ -889,42 +918,51 @@ def importPub(postNum, pub)
       else
         puts "Warning: campus ID #{scheme}::#{id} is switching from oapID #{campusToOAP[scheme][id]} to #{oapID}"
         checkNewAssoc(scheme, id, oapID, campusCache)
-        $db.execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
+        db_execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
       end
     else
       # New association - add it to the db
       checkNewAssoc(scheme, id, oapID, campusCache)
       #puts "  Inserting new OAP ID."
-      $db.execute("INSERT INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
+      db_execute("INSERT INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
     end
   }
+
+  # Ready for import
+  $importQueue << [postNum, pub, ids, bestItem, oapID]
+end  
+
+###################################################################################################
+# Bring this grouped publication into Elements
+def importPub(postNum, pub, ids, bestItem, oapID)
+  printed = false
 
   # Form the XML that we will PUT into Elements
   toPut = makeRecordToPut(bestItem, ids)
 
   # Check if we've already put the exact same thing.
   newHash = Digest::SHA1.hexdigest toPut
-  oldHash = $db.get_first_value('SELECT oap_hash FROM oap_hashes WHERE oap_id = ?', oapID)
+  oldHash = db_get_first_value('SELECT oap_hash FROM oap_hashes WHERE oap_id = ?', oapID)
   isUpdated = false
   if !$forceMode && (oldHash == newHash)
     #puts "  Skip: Existing record is the same."
   else
-    printed or printed = printPub(postNum, pub, oapID)
+    printed ||= printPub(postNum, pub, oapID)
     isJoinedRecord, isElemCompat, elemItem = putRecord(pub, oapID, toPut)
-    $db.execute('INSERT OR REPLACE INTO oap_flags (oap_id, isJoinedRecord, isElemCompat) VALUES (?, ?, ?)',
+    db_execute('INSERT OR REPLACE INTO oap_flags (oap_id, isJoinedRecord, isElemCompat) VALUES (?, ?, ?)',
       [oapID, isJoinedRecord ? 1 : 0, isElemCompat ? 1 : 0])
     isUpdated = true
   end
 
   # Now associate this record with each author we haven't associated before
   anyNewUsers = false
-  oldUsers = $db.get_first_value('SELECT oap_users FROM oap_hashes WHERE oap_id = ?', oapID)
+  oldUsers = db_get_first_value('SELECT oap_users FROM oap_hashes WHERE oap_id = ?', oapID)
   oldUsers = Set.new(oldUsers ? oldUsers.split('|') : []) 
   pub.userPropIds.each { |userPropID|
     if !$forceMode && oldUsers.include?(userPropID)
       #puts "  Skip: User #{userPropID} already associated."
     else
-      printed or printed = printPub(postNum, pub, oapID)
+      printed ||= printPub(postNum, pub, oapID)
       postRelationship(oapID, userPropID)
       anyNewUsers = true
     end
@@ -933,7 +971,7 @@ def importPub(postNum, pub)
   # Keep our database up-to-date in terms of what's been sent already to Elements, so we can avoid
   # re-doing work in the future.
   if isUpdated or anyNewUsers
-    $db.execute('INSERT OR REPLACE INTO oap_hashes (oap_id, updated, oap_hash, oap_users) VALUES (?, ?, ?, ?)',
+    db_execute('INSERT OR REPLACE INTO oap_hashes (oap_id, updated, oap_hash, oap_users) VALUES (?, ?, ?, ?)',
       [oapID, DateTime.now.iso8601, newHash, pub.userPropIds.to_a.join('|')])
   end
 
@@ -959,6 +997,30 @@ def importPub(postNum, pub)
 end
 
 ###################################################################################################
+def processMints
+  loop do
+    postNum, pub = $mintQueue.pop
+    break if postNum == "END"
+    mintPub(postNum, pub)
+  end
+  $importQueue << "END"
+end
+
+###################################################################################################
+def processImports
+  postNum = 0
+  loop do
+    (postNum, pub, ids, bestItem, oapID) = $importQueue.pop
+    break if postNum == "END"
+    importPub(postNum, pub, ids, bestItem, oapID)
+    if (postNum % 1000) == 0
+      puts "Checked #{postNum} of #{$toPost.size} posts."
+    end
+  end
+  puts "Checked #{postNum} of #{$toPost.size} posts."
+end
+
+###################################################################################################
 # Top-level driver
 def main
 
@@ -971,10 +1033,6 @@ def main
     else 'http://unknown-host/elements-secure-api'
   end
   $ezidSession = Ezid::ApiSession.new(ezidCred[0], ezidCred[1], :ark, shoulder, 'https://ezid.cdlib.org')
-  #puts "Minting an ARK."
-  #puts mintOAPID({'erc.who' => 'eScholarship harvester',
-  #                'erc.what' => 'A test OAP identifier',
-  #                'erc.when' => DateTime.now.iso8601})
 
   # Need credentials for talking to the Elements API
   ($apiCred = Netrc.read[URI($elementsAPI).host]) or raise("Need credentials for #{URI($elementsAPI).host} in ~/.netrc")
@@ -1051,22 +1109,31 @@ def main
     genReportHeader
   end
 
+  # Fire up threads for minting and importing
+  Thread.abort_on_exception = true
+  mintThread = Thread.new {
+    processMints
+  }
+  importThread = Thread.new {
+    processImports
+  }
+
   # Check and post each group
   puts "Checking #{$toPost.size} posts."
   postNum = 0
   $toPost.each { |pub|
-    # Post it.
     postNum += 1
-    importPub(postNum, pub)
-    if (postNum % 1000) == 0
-      puts "Checked #{postNum} posts."
-    end
+    $mintQueue << [postNum, pub]
+    break if postNum > 60
   }
+  $mintQueue << "END"
+
+  mintThread.join
+  importThread.join
 
   # Finish off report (in report mode)
   $reportMode and $reportFile.close
 
-  puts "Checked #{postNum} posts."
   puts "All done."
 end
 
