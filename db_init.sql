@@ -8,6 +8,15 @@ CREATE TABLE ids (
 
 CREATE INDEX oap_id ON ids(oap_id);
 
+-- Table of eschol items that are softly linked, or 'equivalent', to Elements pubs
+-- There can be many pubs that link to an eSchol item.
+CREATE TABLE eschol_equiv (
+  pub_id        TEXT PRIMARY KEY NOT NULL,
+  eschol_ark    TEXT NOT NULL
+);
+
+CREATE INDEX equiv_ark ON eschol_equiv(eschol_ark);
+
 -- Table of email address -> proprietary ID. A prop-id can link to more than one email, e.g.
 -- if a user changes their email address over time.
 CREATE TABLE emails (
