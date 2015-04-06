@@ -1124,7 +1124,6 @@ def main
   $toPost.each { |pub|
     postNum += 1
     $mintQueue << [postNum, pub]
-    break if postNum > 60
   }
   $mintQueue << "END"
 
