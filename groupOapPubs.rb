@@ -1029,7 +1029,7 @@ def main
   puts "Starting EZID session."
   shoulder = case $hostname
     when 'submit-stg', 'submit-dev'; '99999/fk4'
-    when 'cdl-submit-p01'; '13030/p4'
+    when 'cdl-submit-p01'; '13030/p8'
     else 'http://unknown-host/elements-secure-api'
   end
   $ezidSession = Ezid::ApiSession.new(ezidCred[0], ezidCred[1], :ark, shoulder, 'https://ezid.cdlib.org')
