@@ -91,8 +91,8 @@ end
 # Determine the Elements API instance to connect to, based on the host name
 $hostname = `/bin/hostname`.strip
 $elementsUI = case $hostname
-  when 'submit-stg', 'submit-dev'; 'https://qa-oapolicy.universityofcalifornia.edu'
-  when 'cdl-submit-p01'; 'https://oapolicy.universityofcalifornia.edu'
+  when 'pub-submit-stg-2a', 'pub-submit-stg-2c', 'pub-submit-dev'; 'https://qa-oapolicy.universityofcalifornia.edu'
+  when 'pub-submit-prd-2a', 'pub-submit-prd-2c'; 'https://oapolicy.universityofcalifornia.edu'
   else 'http://unknown-host'
 end
 $elementsAPI = "#{$elementsUI}:8002/elements-secure-api"
@@ -1028,8 +1028,8 @@ def main
   (ezidCred = Netrc.read['ezid.cdlib.org']) or raise("Need credentials for ezid.cdlib.org in ~/.netrc")
   puts "Starting EZID session."
   shoulder = case $hostname
-    when 'submit-stg', 'submit-dev'; '99999/fk4'
-    when 'cdl-submit-p01'; '13030/p8'
+    when 'pub-submit-stg-2a', 'pub-submit-stg-2c', 'pub-submit-dev'; '99999/fk4'
+    when 'pub-submit-prd-2a', 'pub-submit-prd-2c'; '13030/p8'
     else 'http://unknown-host/elements-secure-api'
   end
   $ezidSession = Ezid::ApiSession.new(ezidCred[0], ezidCred[1], :ark, shoulder, 'https://ezid.cdlib.org')
