@@ -9,6 +9,7 @@ gems
 Gemfile.lock
 log
 oap.db
+oap_test.db
 old
 report.csv
 screenlog.*
