@@ -29,6 +29,7 @@ STDOUT.sync = true
 # Special args
 $forceMode = ARGV.delete('--force')
 $reportMode = ARGV.delete('--report')
+$testMode = ARGV.delete('--test')
 
 if ARGV.include? '--only'
   pos = ARGV.index '--only'
@@ -45,7 +46,12 @@ $authKeys = Hash.new{|h, k| h[k] = calcAuthorKeys(k) }
 $pubs = []
 $emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
 $credentials = nil
-$db = SQLite3::Database.new("oap.db")
+if $testMode
+  FileUtils.cp "oap.db", "oap_test.db"
+  $db = SQLite3::Database.new("oap_test.db")
+else
+  $db = SQLite3::Database.new("oap.db")
+end
 $db.busy_timeout = 30000
 $dbMutex = Mutex.new
 $transLog = nil
@@ -91,7 +97,7 @@ end
 # Determine the Elements API instance to connect to, based on the host name
 $hostname = `/bin/hostname`.strip
 $elementsUI = case $hostname
-  when 'pub-submit-stg-2a', 'pub-submit-stg-2c', 'pub-submit-dev'; 'https://qa-oapolicy.universityofcalifornia.edu'
+  when 'pub-submit-stg-2a', 'pub-submit-stg-2c'; 'https://qa-oapolicy.universityofcalifornia.edu'
   when 'pub-submit-prd-2a', 'pub-submit-prd-2c'; 'https://oapolicy.universityofcalifornia.edu'
   else 'http://unknown-host'
 end
@@ -557,9 +563,14 @@ end
 ###################################################################################################
 # Mint a new OAP identifier
 def mintOAPID(metadata)
-  resp = $ezidSession.mint(metadata)
-  resp.respond_to?(:errored?) and resp.errored? and raise("Error minting ark: #{resp.response}")
-  return resp.identifier
+  if $testMode
+    puts "(test mode: inventing something random rather than calling EZID)"
+    return "ark:/13030/fk#{(0...8).map { (65 + rand(26)).chr }.join}"
+  else
+    resp = $ezidSession.mint(metadata)
+    resp.respond_to?(:errored?) and resp.errored? and raise("Error minting ark: #{resp.response}")
+    return resp.identifier
+  end
 end
 
 ###################################################################################################
@@ -683,6 +694,11 @@ def putRecord(pub, oapID, toPut)
   $transLog.write(toPut)
   $transLog.flush
 
+  if $testMode
+    puts "(test mode: skipping real put)"
+    return true, true, nil
+  end
+
   # And put it
   req = Net::HTTP::Put.new(uri)
   req['Content-Type'] = 'text/xml'
@@ -762,6 +778,11 @@ def postRelationship(oapID, userPropID)
   $transLog.write("\n---------------------------------------------------------------\n")
   $transLog.write("\nPOST #{uri}\n\n")
   $transLog.write(toPost)
+
+  if $testMode
+    puts "(test mode: skipping real put)"
+    return
+  end
 
   # And put it
   (1..10).each { |tryNumber|
@@ -980,7 +1001,7 @@ def importPub(postNum, pub, ids, bestItem, oapID)
     addToReport(pub, oapID, bestItem)
   end
 
-  # For testing, stop on first non-joined or non-compat record
+  # For testing, log non-joined or non-compat record
   if isUpdated
     if isJoinedRecord && !isElemCompat
       puts "NOTE: incompatible join - see log for details."
@@ -1028,9 +1049,9 @@ def main
   (ezidCred = Netrc.read['ezid.cdlib.org']) or raise("Need credentials for ezid.cdlib.org in ~/.netrc")
   puts "Starting EZID session."
   shoulder = case $hostname
-    when 'pub-submit-stg-2a', 'pub-submit-stg-2c', 'pub-submit-dev'; '99999/fk4'
+    when 'pub-submit-stg-2a', 'pub-submit-stg-2c'; '99999/fk4'
     when 'pub-submit-prd-2a', 'pub-submit-prd-2c'; '13030/p8'
-    else 'http://unknown-host/elements-secure-api'
+    else raise "Unrecognized hostname for shoulder determination."
   end
   $ezidSession = Ezid::ApiSession.new(ezidCred[0], ezidCred[1], :ark, shoulder, 'https://ezid.cdlib.org')
 
@@ -1138,7 +1159,7 @@ end
 
 # Record the actions in the transaction log file
 FileUtils::mkdir_p('log')
-open("log/trans-#{DateTime.now.strftime('%F')}.log", "a:utf-8") { |io|
+open("log/#{$testMode ? 'test' : 'trans'}-#{DateTime.now.strftime('%F')}.log", "a:utf-8") { |io|
   $transLog = io
   main()
 }
