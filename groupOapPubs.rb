@@ -430,12 +430,11 @@ def iterateRecords(filename)
 end
 
 ###################################################################################################
-def readItems(filename)
+def buildItemCache(filename)
   FileUtils::mkdir_p('cache')
   cacheFile = "cache/#{filename}.cache"
   if File.exists?(cacheFile) && File.mtime(cacheFile) > File.mtime(filename)
-    puts "Reading cache for #{filename}."
-    Zlib::GzipReader.open(cacheFile) { |io| return Marshal.load(io) }
+    return
   else
     items = []
     campusIdToItem = {}
@@ -482,7 +481,18 @@ def readItems(filename)
 
     puts "Writing cache file."
     Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump(items, io) }
-    return items
+  end
+end
+
+###################################################################################################
+def readItems(filename)
+  FileUtils::mkdir_p('cache')
+  cacheFile = "cache/#{filename}.cache"
+  if File.exists?(cacheFile) && File.mtime(cacheFile) > File.mtime(filename)
+    puts "Reading cache for #{filename}."
+    Zlib::GzipReader.open(cacheFile) { |io| return Marshal.load(io) }
+  else
+    raise("Cache file should have been build already.")
   end
 end
 
@@ -827,9 +837,9 @@ def printPub(postNum, pub, oapID)
     puts "Post \##{postNum} of #{$toPost.size}:"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-      puts "  #{item.title} [#{$typeIds[item.typeId]}]"
-      puts "      #{item.date ? item.date : '<no date>'}     #{item.authors.join('; ').gsub('|;', ';')}"
-      puts "      #{idStr}"
+      puts "  INFO: #{item.title} [#{$typeIds[item.typeId]}]"
+      puts "  INFO:     #{item.date ? item.date : '<no date>'}     #{item.authors.join('; ').gsub('|;', ';')}"
+      puts "  INFO:     #{idStr}"
     }
     oapID and puts "  OAP ID: #{oapID}"
     return true
@@ -1058,7 +1068,16 @@ def main
   # Need credentials for talking to the Elements API
   ($apiCred = Netrc.read[URI($elementsAPI).host]) or raise("Need credentials for #{URI($elementsAPI).host} in ~/.netrc")
 
+  if $testMode
+    puts "\n*** TEST MODE: No IDs will be minted, no actual posts will be made. ***\n"
+  end
+
   # Read the primary data, parse it, and build our hashes
+  puts "Building item caches."
+  ARGV.each { |filename|
+    buildItemCache(filename)
+  }
+
   puts "Reading and adding items."
   ARGV.each { |filename|
     addItems(readItems(filename))
