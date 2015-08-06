@@ -1055,6 +1055,9 @@ end
 # Top-level driver
 def main
 
+  puts "\n==================================================="
+  puts "groupOapPubs running: #{DateTime.now.iso8601}\n"
+
   # We'll need credentials for talking to EZID
   (ezidCred = Netrc.read['ezid.cdlib.org']) or raise("Need credentials for ezid.cdlib.org in ~/.netrc")
   puts "Starting EZID session."
