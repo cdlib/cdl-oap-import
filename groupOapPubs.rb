@@ -74,6 +74,18 @@ $stopwords = Set.new(("a an the of and to in that was his he it with is for as h
 
 # Structure for holding information on an item
 Item = Struct.new(:typeId, :title, :docKey, :authors, :date, :ids, :journal, :volume, :issue, :otherInfo) {
+  def self.load(campusID)
+    itemData = db_get_first_value("SELECT item_data FROM raw_items WHERE campus_id = ?", campusID.join("::"))
+    itemData or raise("Can't find database record for campus ID #{campusID.join('::')}")
+    return Marshal.load(itemData)
+  end
+
+  def save
+    campusIDs.length == 1 or raise("Can only save single-ID item to database.")
+    db_execute("INSERT OR REPLACE INTO raw_items (campus_id, doc_key, item_data) VALUES (?, ?, ?)",
+               [campusIDs[0].join("::"), docKey, Marshal.dump(self)])
+  end
+
   def campusIDs
     ids.select { |scheme, text| isCampusID(scheme) }
   end
@@ -431,57 +443,68 @@ end
 
 ###################################################################################################
 def buildItemCache(filename)
-  FileUtils::mkdir_p('cache')
-  cacheFile = "cache/#{filename}.cache"
-  if File.exists?(cacheFile) && File.mtime(cacheFile) > File.mtime(filename)
+
+  # Figure out which campus we're talking about
+  campus = ALL_CAMPUSES.find { |c| filename.include? c }
+  campus or raise("Can't figure out campus of file #{filename.inspect}")
+
+  # Check if we've already got this data in our database.
+  stamp = db_get_first_value("SELECT updated FROM raw_item_stamps WHERE campus = ?", campus)
+  if stamp and stamp.to_i >= File.mtime(filename).to_i
     return
-  else
-    items = []
-    campusIdToItem = {}
-    puts "Reading and parsing #{filename}."
-    nParsed = 0
-    nDupes = 0
-    iterateRecords(filename) { |record|
-      record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
-      typeId = record.attr('type-id').to_i
-      $typeIds[typeId] or raise("Unknown type-id #{typeId}")
-      item = parseElemNativeRecord(record.at('native'), typeId)
-
-      # A few records have no title. We can't do anything with them.
-      if item.title == nil || item.title.length == 0
-        idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-        puts "Warning: item with empty title: #{idStr} ... skipped."
-        next
-      end
-
-      # Identifier parsing
-      campusId = item.campusIDs[0]
-      campusId or raise("No campus ID found: #{record}")
-
-      # Bundle up the result (or in the case of a dupe merge the author info)
-      if campusIdToItem.include? campusId
-        nDupes += 1
-        mergeAuthorInfo(campusIdToItem[campusId], item)
-        next
-     else
-        campusIdToItem[campusId] = item
-        items << item
-        #puts item
-      end
-
-      # Give feedback every once in a while.
-      nParsed += 1
-      if (nParsed % 1000) == 0
-        puts "...#{nParsed} parsed (#{nDupes} dupes merged)."
-        # TODO: For debugging speed, stop after 10000 records. For real production run, take this out!
-        #break if nParsed == 10000
-      end      
-    }
-    puts "...#{nParsed} parsed (#{nDupes} dupes merged)."
-
-    puts "Writing cache file."
-    Zlib::GzipWriter.open(cacheFile) { |io| Marshal.dump(items, io) }
   end
+
+  # Blow away any existing raw item records for this campus, since we're going to re-insert them.
+  db_execute("DELETE FROM raw_item_stamps WHERE campus = ?", campus)
+  db_execute("DELETE FROM raw_items WHERE campus_id LIKE ?", "#{campus}::%")
+
+  # Now let's parse the data and re-insert it.
+  campusIds = Set.new
+  puts "Reading and parsing #{filename}."
+  nParsed = 0
+  nDupes = 0
+  iterateRecords(filename) { |record|
+    record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
+    typeId = record.attr('type-id').to_i
+    $typeIds[typeId] or raise("Unknown type-id #{typeId}")
+    item = parseElemNativeRecord(record.at('native'), typeId)
+
+    # A few records have no title. We can't do anything with them.
+    if item.title == nil || item.title.length == 0
+      idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
+      puts "Warning: item with empty title: #{idStr} ... skipped."
+      next
+    end
+
+    # Identifier parsing
+    campusId = item.campusIDs[0]
+    campusId or raise("No campus ID found: #{record}")
+
+    # Bundle up the result (or in the case of a dupe merge the author info)
+    if campusIds.include? campusId
+      nDupes += 1
+      oldItem = Item.load(campusId)
+      mergeAuthorInfo(oldItem, item)
+      oldItem.save
+   else
+      campusIds << campusId
+      item.save
+      #puts item
+    end
+
+    # Give feedback every once in a while.
+    nParsed += 1
+    if (nParsed % 1000) == 0
+      puts "...#{nParsed} parsed (#{nDupes} dupes merged)."
+      # TODO: For debugging speed, stop after 10000 records. For real production run, take this out!
+      #break if nParsed == 10000
+    end      
+  }
+  puts "...#{nParsed} parsed (#{nDupes} dupes merged)."
+
+  # Mark the fact that we've processed this data so we won't have to next time around.
+  db_execute("INSERT OR REPLACE INTO raw_item_stamps (campus, updated) VALUES (?, ?)", 
+    campus, File.mtime(filename).to_i)
 end
 
 ###################################################################################################
@@ -1080,6 +1103,8 @@ def main
   ARGV.each { |filename|
     buildItemCache(filename)
   }
+
+  raise("foo")
 
   puts "Reading and adding items."
   ARGV.each { |filename|
