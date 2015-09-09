@@ -39,11 +39,8 @@ if ARGV.include? '--only'
 end
 
 # Global variables
-$allItems = []
-$docKeyToItems = Hash.new{|h, k| h[k] = Array.new }
 $titleCount = Hash.new{|h, k| h[k] = 0 }
 $authKeys = Hash.new{|h, k| h[k] = calcAuthorKeys(k) }
-$pubs = []
 $emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
 $credentials = nil
 if $testMode
@@ -55,7 +52,6 @@ end
 $db.busy_timeout = 30000
 $dbMutex = Mutex.new
 $transLog = nil
-$toPost = nil
 $reportFile = nil
 $mintQueue = SizedQueue.new(100)
 $importQueue = SizedQueue.new(100)
@@ -508,27 +504,6 @@ def buildItemCache(filename)
 end
 
 ###################################################################################################
-def readItems(filename)
-  FileUtils::mkdir_p('cache')
-  cacheFile = "cache/#{filename}.cache"
-  if File.exists?(cacheFile) && File.mtime(cacheFile) > File.mtime(filename)
-    puts "Reading cache for #{filename}."
-    Zlib::GzipReader.open(cacheFile) { |io| return Marshal.load(io) }
-  else
-    raise("Cache file should have been build already.")
-  end
-end
-
-###################################################################################################
-def addItems(items)
-  $allItems += items
-  items.each { |item|
-    $titleCount[item.title] += 1
-    $docKeyToItems[item.docKey] << item
-  }
-end
-
-###################################################################################################
 def db_get_first_value(stmt, *more)
   $dbMutex.synchronize {
     return $db.get_first_value(stmt, *more)
@@ -550,13 +525,29 @@ end
 ###################################################################################################
 # For items with a matching title key, group together by overlapping authors to form the OA Pubs.
 def groupItems()
-  $docKeyToItems.sort.each { |docKey, items|
+  # Grab all the distinct doc keys
+  allKeys = db_execute("SELECT DISTINCT doc_key FROM raw_items").map { |row| row[0] }
+
+  # Process each key
+  postNum = 0
+  allKeys.each_with_index { |docKey, index|
+    # Clear out the title count hash so we don't eat memory
+    $titleCount = Hash.new{|h, k| h[k] = 0 }
+
+    # Read in the items with this doc key, and count their titles
+    items = []
+    db_execute("SELECT item_data FROM raw_items WHERE doc_key = ?", docKey).each { |row|
+      item = Marshal.load(row[0])
+      $titleCount[item.title] += 1
+      items << item
+    }
 
     # If there are 5 or more dates involved, this is probably a series thing.
     numDates = items.map{ |info| info.date }.uniq.length
 
     # Singleton cases.
-    if items.length == 1 || numDates >= 5 || isSeriesTitle(items[0].title)
+    pubs = []
+    if docKey == "" || items.length == 1 || numDates >= 5 || isSeriesTitle(items[0].title)
       if numDates >= 5
         if !isSeriesTitle(items[0].title)
           #puts "Probable series (#{numDates} dates): #{items[0].title}"
@@ -566,29 +557,58 @@ def groupItems()
       end
       
       # Singletons: make a separate OAPub for each item
-      items.each { |item| $pubs << OAPub.new([item]) }
-      next
+      items.each { |item| pubs << OAPub.new([item]) }
+
+    # Non-singleton case.
+    else
+      # We know the docs all share the same title key. Group those that have compatible authors,
+      # ids, etc.
+      while !items.empty?
+
+        # Get the first item
+        item1 = items.shift
+        pub = OAPub.new([item1])
+
+        # Match it up to every other item that's compatible
+        items.dup.each { |item2|
+          if isCompatible(pub.items, item2)
+            items.delete(item2)
+            pub.items << item2
+          end
+        }
+
+        # Done with this grouped publication
+        pubs << pub
+      end
     end
 
-    # We know the docs all share the same title key. Group those that have compatible authors,
-    # ids, etc.
-    while !items.empty?
+    # Check each pub and queue those that are of interest to us.
+    pubs.each { |pub|
 
-      # Get the first item
-      item1 = items.shift
-      pub = OAPub.new([item1])
-
-      # Match it up to every other item that's compatible
-      items.dup.each { |item2|
-        if isCompatible(pub.items, item2)
-          items.delete(item2)
-          pub.items << item2
-        end
+      # Match email addresses to Elements users
+      pub.items.each { |item|
+        item.authors.each { |author|
+          email = author.gsub(/.*\|/, '').downcase.strip
+          propId = $emailToElementsUser[email]
+          if propId
+            (pub.userEmails ||= Set.new) << email
+            (pub.userPropIds ||= Set.new) << propId
+          end
+        }
       }
 
-      # Done with this grouped publication
-      $pubs << pub
-    end
+      # If no user ids, there's no point in uploading the item
+      pub.userPropIds or next
+
+      # If only doing one campus, skip everything else.
+      if $onlyCampus
+        next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == "c-#{$onlyCampus}-id" }}
+      end
+
+      # Queue it.
+      postNum += 1
+      $mintQueue << [postNum, pub]
+    }
   }
 
 end
@@ -857,7 +877,7 @@ end
 ###################################################################################################
 def printPub(postNum, pub, oapID)
     puts
-    puts "Post \##{postNum} of #{$toPost.size}:"
+    puts "Post \##{postNum}:"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
       puts "  INFO: #{item.title} [#{$typeIds[item.typeId]}]"
@@ -1068,15 +1088,19 @@ def processImports
     break if postNum == "END"
     importPub(postNum, pub, ids, bestItem, oapID)
     if (postNum % 1000) == 0
-      puts "Checked #{postNum} of #{$toPost.size} posts."
+      puts "Checked #{postNum} posts."
     end
   end
-  puts "Checked #{postNum} of #{$toPost.size} posts."
+  puts "Checked #{postNum} posts."
 end
 
 ###################################################################################################
 # Top-level driver
 def main
+
+  # Record the actions in the transaction log file
+  FileUtils::mkdir_p('log')
+  $transLog = open("log/#{$testMode ? 'test' : 'trans'}-#{DateTime.now.strftime('%F')}.log", "a:utf-8")
 
   puts "\n==================================================="
   puts "groupOapPubs running: #{DateTime.now.iso8601}\n"
@@ -1104,79 +1128,6 @@ def main
     buildItemCache(filename)
   }
 
-  raise("foo")
-
-  puts "Reading and adding items."
-  ARGV.each { |filename|
-    addItems(readItems(filename))
-  }
-
-  # Print out things we're treating as series titles
-  cutoff = 5
-  $titleCount.sort.each { |title, count|
-    if isSeriesTitle(title)
-      if count < cutoff
-        #puts "Treating as series but #{count} is below cutoff: #{title}"
-      else
-        #puts "Series title: #{title}"
-      end
-    else
-      if count >= cutoff
-        #puts "Not treating as series title but #{count} is above cutoff: #{title}"
-      end
-    end
-  }
-
-  # Group items by key
-  puts "Grouping items."
-  groupItems()
-
-  puts "Counting by campus."
-  countByCampus = Hash.new{|h, k| h[k] = 0 }
-  $pubs.each { |pub|
-    schemes = Set.new
-    pub.items.each { |item|
-      item.ids.each { |scheme, id|
-        schemes.include?(scheme) or countByCampus[scheme] = countByCampus[scheme] + 1
-        schemes << scheme
-      }
-    }
-  }
-  puts "Number to post, by id scheme: #{countByCampus}"
-
-  puts "Counting total to check this run."
-  $toPost = []
-  $pubs.each { |pub|
-    # Match email addresses to Elements users
-    pub.items.each { |item|
-      item.authors.each { |author|
-        email = author.gsub(/.*\|/, '').downcase.strip
-        propId = $emailToElementsUser[email]
-        if propId
-          (pub.userEmails ||= Set.new) << email
-          (pub.userPropIds ||= Set.new) << propId
-        end
-      }
-    }
-
-    # If no user ids, there's no point in uploading the item
-    pub.userPropIds or next
-
-    # If only doing one campus, skip everything else.
-    if $onlyCampus
-      next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == "c-#{$onlyCampus}-id" }}
-    end
-
-    $toPost << pub
-  }
-
-  # In report more, generate a report CSV file
-  if $reportMode
-    puts "Creating report.csv."
-    $reportFile = open("report.csv", "w:utf-8")
-    genReportHeader
-  end
-
   # Fire up threads for minting and importing
   Thread.abort_on_exception = true
   mintThread = Thread.new {
@@ -1186,27 +1137,25 @@ def main
     processImports
   }
 
-  # Check and post each group
-  puts "Checking #{$toPost.size} posts."
-  postNum = 0
-  $toPost.each { |pub|
-    postNum += 1
-    $mintQueue << [postNum, pub]
-  }
-  $mintQueue << "END"
+  # In report more, generate a report CSV file
+  if $reportMode
+    puts "Creating report.csv."
+    $reportFile = open("report.csv", "w:utf-8")
+    genReportHeader
+  end
 
+  # Group items by key and add them to the minting queue
+  puts "Grouping items."
+  groupItems()
+
+  # Finish every last thing
+  $mintQueue << "END"
   mintThread.join
   importThread.join
-
-  # Finish off report (in report mode)
   $reportMode and $reportFile.close
 
   puts "All done."
 end
 
-# Record the actions in the transaction log file
-FileUtils::mkdir_p('log')
-open("log/#{$testMode ? 'test' : 'trans'}-#{DateTime.now.strftime('%F')}.log", "a:utf-8") { |io|
-  $transLog = io
-  main()
-}
+# The main action
+main()
