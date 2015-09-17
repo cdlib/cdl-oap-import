@@ -25,6 +25,7 @@ end
 
 ###################################################################################################
 def updateEmails(filename, db)
+  db.busy_timeout = 30000
   doc = Nokogiri::XML(filename =~ /\.gz$/ ? Zlib::GzipReader.open(filename) : File.open(filename), &:noblanks)
   doc.remove_namespaces!
   doc.xpath('records/*').each { |record|

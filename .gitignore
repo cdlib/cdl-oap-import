@@ -2,6 +2,7 @@
 *.swp
 *.xml
 *.xml.gz
+*.log
 bin
 cache
 crawled

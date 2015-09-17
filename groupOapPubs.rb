@@ -23,6 +23,8 @@ require 'sqlite3'
 require 'thread'
 require 'zlib'
 
+require_relative 'rawItem'
+
 # Flush stdout after each write
 STDOUT.sync = true
 
@@ -55,40 +57,6 @@ $transLog = nil
 $reportFile = nil
 $mintQueue = SizedQueue.new(100)
 $importQueue = SizedQueue.new(100)
-
-ALL_CAMPUSES = ['eschol', 'ucla', 'uci', 'ucsf']
-
-# Elements type IDs
-$typeIds = { 2 => 'book',
-             3 => 'chapter',
-             4 => 'conference',
-             5 => 'article' }
-
-# Common English stop-words
-$stopwords = Set.new(("a an the of and to in that was his he it with is for as had you not be her on at by which have or " +
-                      "from this him but all she they were my are me one their so an said them we who would been will no when").split)
-
-# Structure for holding information on an item
-Item = Struct.new(:typeId, :title, :docKey, :authors, :date, :ids, :journal, :volume, :issue, :otherInfo) {
-  def self.load(campusID)
-    itemData = db_get_first_value("SELECT item_data FROM raw_items WHERE campus_id = ?", campusID.join("::"))
-    itemData or raise("Can't find database record for campus ID #{campusID.join('::')}")
-    return Marshal.load(itemData)
-  end
-
-  def save
-    campusIDs.length == 1 or raise("Can only save single-ID item to database.")
-    db_execute("INSERT OR REPLACE INTO raw_items (campus_id, doc_key, item_data) VALUES (?, ?, ?)",
-               [campusIDs[0].join("::"), docKey, Marshal.dump(self)])
-  end
-
-  def campusIDs
-    ids.select { |scheme, text| isCampusID(scheme) }
-  end
-}
-
-# Less common item info (only for books, conferences, etc.)
-OtherItemInfo = Struct.new(:abstract, :editors, :publisher, :placeOfPublication, :pagination, :nameOfConference, :parentTitle)
 
 # Structure for holding a group of duplicate items
 OAPub = Struct.new(:items, :userEmails, :userPropIds)
@@ -160,79 +128,12 @@ seriesTitles = [
 ]
 $seriesTitlesPat = Regexp.new("^(#{seriesTitles.join('|').downcase})$")
 
-# Transliteration tables -- a cheesy but easy way to remove accents without requiring a Unicode gem
-$transFrom = "ÀÁÂÃÄÅàáâãäåĀāĂăĄąÇçĆćĈĉĊċČčÐðĎďĐđÈÉÊËèéêëĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħÌÍÎÏìíîïĨĩĪīĬĭĮįİıĴĵĶķĸĹĺĻļĽ" +
-             "ľĿŀŁłÑñŃńŅņŇňŉŊŋÒÓÔÕÖØòóôõöøŌōŎŏŐőŔŕŖŗŘřŚśŜŝŞşŠšſŢţŤťŦŧÙÚÛÜùúûüŨũŪūŬŭŮůŰűŲųŴŵÝýÿŶŷŸŹźŻżŽž"
-$transTo   = "AAAAAAaaaaaaAaAaAaCcCcCcCcCcDdDdDdEEEEeeeeEeEeEeEeEeGgGgGgGgHhHhIIIIiiiiIiIiIiIiIiJjKkkLlLlL" +
-             "lLlLlNnNnNnNnnNnOOOOOOooooooOoOoOoRrRrRrSsSsSsSssTtTtTtUUUUuuuuUuUuUuUuUuUuWwYyyYyYZzZzZz"
-
-###################################################################################################
-# Monkey patches to make Nokogiri even more elegant
-class Nokogiri::XML::Node
-  def text_at(xpath)
-    at(xpath) ? at(xpath).text : nil
-  end
-end
-
-###################################################################################################
-# Remove accents from a string
-def transliterate(str)
-  str.tr($transFrom, $transTo)
-end
-
-###################################################################################################
-# Convert to lower case, remove HTML-like elements, strip out weird characters, normalize spaces.
-def normalize(str)
-  str or return ''
-  # NO: tmp = transliterate(str)  # This is dangerous: strips out accents in titles and author names!
-  tmp = str.gsub(/&lt[;,]/, '<').gsub(/&gt[;,]/, '>').gsub(/&#?\w+[;,]/, '')
-  tmp = tmp.gsub(/<[^>]+>/, ' ').gsub(/\\n/, ' ')
-  tmp = tmp.gsub(/[|]/, '')
-  tmp = tmp.gsub(/\s\s+/,' ').strip
-  return tmp
-end
-
-###################################################################################################
-# Special normalization for identifiers
-def normalizeIdentifier(str)
-  str or return ''
-  tmp = str.downcase.strip
-  tmp = tmp.sub(/^https?:\/\/dx.doi.org\//, '').sub(/^(doi(\.org)?|pmid|pmcid):/, '').sub(/\.+$/, '')
-  tmp = tmp.sub(/^\[(.*)\]$/, '\1').sub(/^"(.*)"$/, '\1').sub(/^\[(.*)\]$/, '\1').sub(/^"(.*)"$/, '\1')
-  return tmp
-end
-
-###################################################################################################
-# Special normalization for ERC metadata
-def normalizeERC(str)
-  return transliterate(normalize(str)).encode('ascii', {:replace => '.'})
-end
-
-###################################################################################################
-# Title-specific normalization
-def filterTitle(title)
-  # Break it into words, and remove the stop words.
-  transliterate(normalize(title)).downcase.gsub(/[^a-z0-9 ]/, '').split.select { |w| !$stopwords.include?(w) }
-end
-
-###################################################################################################
-def calcAuthorKeys(item)
-  Set.new(item.authors.map { |auth|
-    transliterate(normalize(auth)).downcase.gsub(/[^a-z]/,'')[0,4]
-  })
-end  
-
 ###################################################################################################
 # Determine if the title is a likely series item
 def isSeriesTitle(title)
   $titleCount[title] == 1 and return false
   ft = transliterate(title).downcase.gsub(/^[\[\(]|[\)\]]$/, '').gsub(/\s\s+/, ' ').gsub('’', '\'').strip()
   return $seriesTitlesPat.match(ft)
-end
-
-###################################################################################################
-def isCampusID(scheme)
-  return scheme =~ /^c-/
 end
 
 ###################################################################################################
@@ -276,87 +177,6 @@ def isCompatible(items, cand)
 
   # All done.
   return ok
-end
-
-###################################################################################################
-def parseElemNativeRecord(native, typeId)
-
-  # Title parsing and doc key generation
-  title = normalize(native.text_at("field[@name='title']/text"))
-  docKey = filterTitle(title).join(' ')
-
-  # Author parsing
-  authors = native.xpath("field[@name='authors']/people/person").map { |person|
-    lname = normalize(person.text_at('last-name'))
-    initials = normalize(person.text_at('initials'))
-    email = normalize(person.text_at('email-address'))
-    "#{lname}, #{initials}|#{email}"
-  }
-  
-  # Date parsing
-  dateField = native.at("field[@name='publication-date']/date")
-  if dateField
-    year = dateField.at("year") ? dateField.at("year").text : '0'
-    month = dateField.at("month") ? dateField.at("month").text : '0'
-    day = dateField.at("day") ? dateField.at("day").text : '0'
-    date = "#{year.rjust(4,'0')}-#{month.rjust(2,'0')}-#{day.rjust(2,'0')}"
-  else
-    date = nil
-  end
-
-  # Identifier parsing
-  ids = []
-  ALL_CAMPUSES.each { |campus|
-    tmp = native.text_at("field[@name='c-#{campus}-id']/text")
-    tmp and ids << ["c-#{campus}-id", normalizeIdentifier(tmp)]
-  }
-
-  tmp = native.text_at("doi/text")
-  tmp or tmp = native.text_at("field[@name='doi']/text")
-  tmp and ids << ['doi', normalizeIdentifier(tmp)]
-
-  native.xpath("field[@name='external-identifiers']/identifiers/identifier").each { |ident|
-    scheme = ident['scheme'].downcase.strip
-    text = normalizeIdentifier(ident.text)
-    ids << [scheme, text]
-  }
-
-  # Journal/vol/iss
-  journal = native.text_at("field[@name='journal']/text")
-  volume  = native.text_at("field[@name='volume']/text")
-  issue   = native.text_at("field[@name='issue']/text")
-
-  # Other info (not present for most items, since most are journal articles)
-  other = OtherItemInfo.new
-  other.abstract = native.text_at("field[@name='abstract']/text")
-  other.publisher = native.text_at("field[@name='publisher']/text")
-  other.placeOfPublication = native.text_at("field[@name='place-of-publication']/text")
-  other.nameOfConference = native.text_at("field[@name='name-of-conference']/text")
-  other.parentTitle = native.text_at("field[@name='parent-title']/text")
-
-  if native.text_at("field[@name='editors']//person/last-name") && native.text_at("field[@name='editors']//person/last-name").length > 0
-    other.editors = native.xpath("field[@name='editors']//person").map { |person|
-      lname = normalize(person.text_at('last-name'))
-      initials = normalize(person.text_at('initials'))
-      email = normalize(person.text_at('email-address'))
-      "#{lname}, #{initials}|#{email}"
-    }
-  end
-
-  if native.at("field[@pagination]/text")
-    str = native.text_at("field[@pagination]/text").strip
-    if str =~ /(\d+)\s*-\s*(\d+)/
-      firstPage = $1
-      lastPage = $2
-      if lastPage.length < firstPage.length   # handle "213-23"
-        lastPage = firstPage[0, firstPage.length - lastPage.length] + lastPage
-      end
-      other.pagination = [firstPage, lastPage]
-    end
-  end
-
-  # Bundle up the result
-  return Item.new(typeId, title, docKey, authors, date, ids, journal, volume, issue, (other.select{|v| v}.empty?) ? nil : other)
 end
 
 ###################################################################################################
@@ -445,14 +265,12 @@ def buildItemCache(filename)
   campus or raise("Can't figure out campus of file #{filename.inspect}")
 
   # Check if we've already got this data in our database.
-  stamp = db_get_first_value("SELECT updated FROM raw_item_stamps WHERE campus = ?", campus)
-  if stamp and stamp.to_i >= File.mtime(filename).to_i
-    return
-  end
+  existing = db_get_first_value("SELECT COUNT(*) FROM raw_items WHERE campus_id LIKE ? AND updated >= ?",
+                                "c-#{campus}-id::%", File.mtime(filename).to_i)
+  return if existing > 0
 
   # Blow away any existing raw item records for this campus, since we're going to re-insert them.
-  db_execute("DELETE FROM raw_item_stamps WHERE campus = ?", campus)
-  db_execute("DELETE FROM raw_items WHERE campus_id LIKE ?", "#{campus}::%")
+  db_execute("DELETE FROM raw_items WHERE campus_id LIKE ?", "c-#{campus}-id::%")
 
   # Now let's parse the data and re-insert it.
   campusIds = Set.new
@@ -461,9 +279,9 @@ def buildItemCache(filename)
   nDupes = 0
   iterateRecords(filename) { |record|
     record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
-    typeId = record.attr('type-id').to_i
-    $typeIds[typeId] or raise("Unknown type-id #{typeId}")
-    item = parseElemNativeRecord(record.at('native'), typeId)
+    # Parse the record, set the updated time temporarily to zero. At the very end we'll fix the
+    # update time.
+    item = elemNativeToRawItem(record.at('native'), $typeIds[record.attr('type-id').to_i], 0)
 
     # A few records have no title. We can't do anything with them.
     if item.title == nil || item.title.length == 0
@@ -479,12 +297,12 @@ def buildItemCache(filename)
     # Bundle up the result (or in the case of a dupe merge the author info)
     if campusIds.include? campusId
       nDupes += 1
-      oldItem = Item.load(campusId)
+      oldItem = RawItem.load(campusId)
       mergeAuthorInfo(oldItem, item)
-      oldItem.save
+      oldItem.save(method(:db_execute))
    else
       campusIds << campusId
-      item.save
+      item.save(method(:db_execute))
       #puts item
     end
 
@@ -499,8 +317,11 @@ def buildItemCache(filename)
   puts "...#{nParsed} parsed (#{nDupes} dupes merged)."
 
   # Mark the fact that we've processed this data so we won't have to next time around.
-  db_execute("INSERT OR REPLACE INTO raw_item_stamps (campus, updated) VALUES (?, ?)", 
-    campus, File.mtime(filename).to_i)
+  db_execute("UPDATE raw_items SET updated = ? WHERE campus_id LIKE ?",
+    File.mtime(filename).to_i, "c-#{campus}-id::%")
+  existing = db_get_first_value("SELECT COUNT(*) FROM raw_items WHERE campus_id LIKE ? AND updated >= ?",
+                                "c-#{campus}-id::%", File.mtime(filename).to_i)
+  existing > 0 or raise("Failed to update timestamp on raw_items")
 end
 
 ###################################################################################################
@@ -604,6 +425,9 @@ def groupItems()
       if $onlyCampus
         next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == "c-#{$onlyCampus}-id" }}
       end
+
+      # Testing: only grab pubs with an Elements record
+      next unless pub.items.any?{ |item| item.ids.any? { |scheme,id| scheme == "elements" }}
 
       # Queue it.
       postNum += 1
@@ -1127,6 +951,9 @@ def main
   ARGV.each { |filename|
     buildItemCache(filename)
   }
+
+  puts "Exiting early for now."
+  exit 1
 
   # Fire up threads for minting and importing
   Thread.abort_on_exception = true

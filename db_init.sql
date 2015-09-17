@@ -53,13 +53,8 @@ CREATE TABLE oap_flags (
 CREATE TABLE raw_items (
     campus_id     TEXT PRIMARY KEY NOT NULL,
     doc_key       TEXT NOT NULL,
+    updated       INTEGER,
     item_data     STRING
 );
 
 CREATE INDEX raw_it_key ON raw_items(doc_key, campus_id);
-
--- Timestamp of last time raw items were updated from campus source
-CREATE TABLE raw_item_stamps (
-    campus        TEXT PRIMARY KEY NOT NULL,
-    updated       INTEGER
-);
