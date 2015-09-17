@@ -46,6 +46,7 @@ $authKeys = Hash.new{|h, k| h[k] = calcAuthorKeys(k) }
 $emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
 $credentials = nil
 if $testMode
+  puts "\n*** TEST MODE: No IDs will be minted, no actual posts will be made. ***\n"
   FileUtils.cp "oap.db", "oap_test.db"
   $db = SQLite3::Database.new("oap_test.db")
 else
@@ -146,8 +147,8 @@ def isCompatible(items, cand)
 
   # Make sure the candidate has same type-id
   items.each { |item|
-    if item.typeId != cand.typeId
-      #puts "Type-id mismatch for scheme #{scheme.inspect}: #{cand.typeId.inspect} vs #{item.typeId.inspect}"
+    if item.typeName != cand.typeName
+      #puts "Type-id mismatch for scheme #{scheme.inspect}: #{cand.typeName.inspect} vs #{item.typeName.inspect}"
       ok = false
     end
   }
@@ -268,6 +269,7 @@ def buildItemCache(filename)
   existing = db_get_first_value("SELECT COUNT(*) FROM raw_items WHERE campus_id LIKE ? AND updated >= ?",
                                 "c-#{campus}-id::%", File.mtime(filename).to_i)
   return if existing > 0
+  puts "#{campus}: existing timestamp=#{existing} wanted=#{File.mtime(filename).to_i}"
 
   # Blow away any existing raw item records for this campus, since we're going to re-insert them.
   db_execute("DELETE FROM raw_items WHERE campus_id LIKE ?", "c-#{campus}-id::%")
@@ -281,7 +283,7 @@ def buildItemCache(filename)
     record.name == 'import-record' or raise("Unknown record type '#{record.name}'")
     # Parse the record, set the updated time temporarily to zero. At the very end we'll fix the
     # update time.
-    item = elemNativeToRawItem(record.at('native'), $typeIds[record.attr('type-id').to_i], 0)
+    item = elemNativeToRawItem(record.at('native'), $typeIdToName[record.attr('type-id').to_i], 0)
 
     # A few records have no title. We can't do anything with them.
     if item.title == nil || item.title.length == 0
@@ -359,9 +361,20 @@ def groupItems()
     items = []
     db_execute("SELECT item_data FROM raw_items WHERE doc_key = ?", docKey).each { |row|
       item = Marshal.load(row[0])
+      # For now, filter out raw_items from elements
+      if item.ids.any? { |scheme,id| scheme == "elements" }
+        if !$elemSkipPrinted 
+          puts("\nFIXME: Skipping Elements items for now.\n")
+          $elemSkipPrinted = true
+        end
+        next
+      end
       $titleCount[item.title] += 1
       items << item
     }
+
+    # Skip empty sets
+    next if items.empty?
 
     # If there are 5 or more dates involved, this is probably a series thing.
     numDates = items.map{ |info| info.date }.uniq.length
@@ -426,9 +439,6 @@ def groupItems()
         next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == "c-#{$onlyCampus}-id" }}
       end
 
-      # Testing: only grab pubs with an Elements record
-      next unless pub.items.any?{ |item| item.ids.any? { |scheme,id| scheme == "elements" }}
-
       # Queue it.
       postNum += 1
       $mintQueue << [postNum, pub]
@@ -485,7 +495,7 @@ end
 def makeRecordToPut(item, dedupedIds)
   Nokogiri::XML::Builder.new { |xml|
     xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api", 
-            'type-id' => item.typeId) { # 2 = book, 3 = chapter, 4 = conference, 5 = journal-article
+             'type-id' => $typeNameToID[item.typeName]) { # 2 = book, 3 = chapter, 4 = conference, 5 = journal-article
       xml.native {
 
         # Title, author, journal/vol/iss, and date all taken from a single item chosen as the "best"
@@ -629,7 +639,7 @@ def putRecord(pub, oapID, toPut)
       native = obj.at("records/record[@format='native'][source-name='scopus']")
       native or native = obj.at("records/record[@format='native'][source-name='crossref']")
       native or native = otherRecords[0]
-      elemItem = parseElemNativeRecord(native.at('native'), obj.attr('type-id').to_i)
+      elemItem = elemNativeToRawItem(native.at('native'), $typeIdToName[obj.attr('type-id').to_i], 0)
       isElemCompat = isCompatible(pub.items, elemItem)
     end
 
@@ -704,7 +714,7 @@ def printPub(postNum, pub, oapID)
     puts "Post \##{postNum}:"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-      puts "  INFO: #{item.title} [#{$typeIds[item.typeId]}]"
+      puts "  INFO: #{item.title} [#{item.typeName}]"
       puts "  INFO:     #{item.date ? item.date : '<no date>'}     #{item.authors.join('; ').gsub('|;', ';')}"
       puts "  INFO:     #{idStr}"
     }
@@ -737,7 +747,7 @@ def addToReport(pub, oapID, bestItem)
 
   str = "#{oapID}\t" +
         "#{pubID}\t" +
-        "#{$typeIds[bestItem.typeId]}\t" +
+        "#{bestItem.typeName}\t" +
         "#{$elementsUI}/viewobject.html?id=#{pubID}&cid=1\t" +
         "#{isJoinedRecord == 1 ? 'existing' : 'new'}\t" +
         "#{isJoinedRecord == 1 ? isElemCompat : ''}\t" +
@@ -942,18 +952,11 @@ def main
   # Need credentials for talking to the Elements API
   ($apiCred = Netrc.read[URI($elementsAPI).host]) or raise("Need credentials for #{URI($elementsAPI).host} in ~/.netrc")
 
-  if $testMode
-    puts "\n*** TEST MODE: No IDs will be minted, no actual posts will be made. ***\n"
-  end
-
   # Read the primary data, parse it, and build our hashes
   puts "Building item caches."
   ARGV.each { |filename|
     buildItemCache(filename)
   }
-
-  puts "Exiting early for now."
-  exit 1
 
   # Fire up threads for minting and importing
   Thread.abort_on_exception = true

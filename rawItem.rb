@@ -42,25 +42,26 @@ def isCampusID(scheme)
 end
 
 # Elements type IDs
-$typeIds = { 2 => 'book',
-             3 => 'chapter',
-             4 => 'conference',
-             5 => 'journal article',
-             6 => 'patent',
-             7 => 'report',
-             8 => 'software',
-             9 => 'performance',
-             10 => 'composition',
-             11 => 'design',
-             12 => 'artefact',
-             13 => 'exhibition',
-             14 => 'other',
-             15 => 'internet publication',
-             16 => 'scholarly edition',
-             17 => 'poster',
-             18 => 'thesis dissertation',
-             22 => 'dataset'
-           }
+$typeIdToName = { 2 => 'book',
+                  3 => 'chapter',
+                  4 => 'conference',
+                  5 => 'journal article',
+                  6 => 'patent',
+                  7 => 'report',
+                  8 => 'software',
+                  9 => 'performance',
+                  10 => 'composition',
+                  11 => 'design',
+                  12 => 'artefact',
+                  13 => 'exhibition',
+                  14 => 'other',
+                  15 => 'internet publication',
+                  16 => 'scholarly edition',
+                  17 => 'poster',
+                  18 => 'thesis dissertation',
+                  22 => 'dataset'
+                }
+$typeNameToID = $typeIdToName.invert
 
 ###################################################################################################
 # Monkey patches to make Nokogiri even more elegant
@@ -131,7 +132,7 @@ end
 def elemNativeToRawItem(native, typeName, updated)
 
   # Type validation (book, article, etc.)
-  $typeIds.values.include?(typeName) or raise("Unknown typeName #{typeName.inspect}")
+  $typeNameToID.include?(typeName) or raise("Unknown typeName #{typeName.inspect}")
 
   # Title parsing and doc key generation
   title = normalize(native.text_at("field[@name='title']/text"))
