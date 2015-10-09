@@ -32,6 +32,7 @@ STDOUT.sync = true
 $forceMode = ARGV.delete('--force')
 $reportMode = ARGV.delete('--report')
 $testMode = ARGV.delete('--test')
+$onlyElem = ARGV.delete("--onlyElem")
 
 if ARGV.include? '--only'
   pos = ARGV.index '--only'
@@ -296,7 +297,7 @@ def buildItemCache(filename)
     campusId = item.campusIDs[0]
     campusId or raise("No campus ID found: #{record}")
 
-    # Bundle up the result (or in the case of a dupe merge the author info)
+    # Bundle up the result (or in the case of a dupe, merge the author info)
     if campusIds.include? campusId
       nDupes += 1
       oldItem = RawItem.load(campusId)
@@ -359,19 +360,16 @@ def groupItems()
 
     # Read in the items with this doc key, and count their titles
     items = []
+    anyCampus = false
     db_execute("SELECT item_data FROM raw_items WHERE doc_key = ?", docKey).each { |row|
       item = Marshal.load(row[0])
-      # For now, filter out raw_items from elements
-      if item.ids.any? { |scheme,id| scheme == "elements" }
-        if !$elemSkipPrinted 
-          puts("\nFIXME: Skipping Elements items for now.\n")
-          $elemSkipPrinted = true
-        end
-        next
-      end
+      anyCampus ||= (item.campusIDs.length > 0)
       $titleCount[item.title] += 1
       items << item
     }
+
+    # Skip sets that don't contain any campus item(s)
+    next unless anyCampus
 
     # Skip empty sets
     next if items.empty?
@@ -437,6 +435,10 @@ def groupItems()
       # If only doing one campus, skip everything else.
       if $onlyCampus
         next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == "c-#{$onlyCampus}-id" }}
+      end
+
+      if $onlyElem
+        next unless pub.items.any? { |item| item.ids.any? { |scheme,id| scheme == "elements" } && item.campusIDs.length == 0 }
       end
 
       # Queue it.
@@ -537,6 +539,7 @@ def makeRecordToPut(item, dedupedIds)
           xml.field(name: 'external-identifiers') {
             xml.identifiers {
               extIds.each { |scheme, ids|
+                next if scheme == 'elements'
                 scheme == 'pmid' and scheme = 'pubmed'   # map pmid -> pubmed
                 xml.identifier(scheme: scheme) { xml.text ids[0] }
               }
@@ -900,6 +903,8 @@ def importPub(postNum, pub, ids, bestItem, oapID)
   end
 
   $transLog.flush
+  print "Exiting early."
+  exit 1
   #print "Record done. Hit Enter to do another: "
   #STDIN.gets
 end
