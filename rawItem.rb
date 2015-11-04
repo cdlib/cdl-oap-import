@@ -20,6 +20,10 @@ RawItem = Struct.new(:typeName, :title, :docKey, :updated, :authors, :suggestion
   def campusIDs
     ids.select { |scheme, text| isCampusID(scheme) }
   end
+
+  def isFromElements
+    ids.any? { |scheme, text| scheme=="elements" }
+  end
 }
 
 # Less common item info (only for books, conferences, etc.)
@@ -48,7 +52,7 @@ $typeIdToName = { 2 => 'book',
                   5 => 'journal article',
                   6 => 'patent',
                   7 => 'report',
-                  8 => 'software',
+                  8 => 'software / code',
                   9 => 'performance',
                   10 => 'composition',
                   11 => 'design',
@@ -58,8 +62,12 @@ $typeIdToName = { 2 => 'book',
                   15 => 'internet publication',
                   16 => 'scholarly edition',
                   17 => 'poster',
-                  18 => 'thesis dissertation',
-                  22 => 'dataset'
+                  18 => 'thesis / dissertation',
+                  22 => 'dataset',
+                  50 => 'figure',
+                  51 => 'fileset',
+                  52 => 'media',
+                  53 => 'presentation'
                 }
 $typeNameToID = $typeIdToName.invert
 

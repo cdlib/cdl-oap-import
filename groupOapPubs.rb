@@ -48,20 +48,22 @@ $emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
 $credentials = nil
 if $testMode
   puts "\n*** TEST MODE: No IDs will be minted, no actual posts will be made. ***\n"
-  FileUtils.cp "oap.db", "oap_test.db"
+  File.exists?("oap_test.db") or FileUtils.cp "oap.db", "oap_test.db"
   $db = SQLite3::Database.new("oap_test.db")
 else
   $db = SQLite3::Database.new("oap.db")
 end
 $db.busy_timeout = 30000
 $dbMutex = Mutex.new
+$arkDb = SQLite3::Database.new("/apps/eschol/erep/xtf/control/db/arks.db")
+$arkDb.busy_timeout = 30000
 $transLog = nil
 $reportFile = nil
 $mintQueue = SizedQueue.new(100)
 $importQueue = SizedQueue.new(100)
 
 # Structure for holding a group of duplicate items
-OAPub = Struct.new(:items, :userEmails, :userPropIds)
+OAPub = Struct.new(:items, :userEmails, :userPropIds, :suggEmails, :suggPropIds)
 
 # Make puts thread-safe
 $stdoutMutex = Mutex.new
@@ -146,13 +148,16 @@ def isCompatible(items, cand)
   ok = true
   ids = {}
 
-  # Make sure the candidate has same type-id
-  items.each { |item|
-    if item.typeName != cand.typeName
-      #puts "Type-id mismatch for scheme #{scheme.inspect}: #{cand.typeName.inspect} vs #{item.typeName.inspect}"
-      ok = false
-    end
-  }
+  # Make sure the candidate has same type-id. Well, only check that if we're trying to match non-Elements
+  # things. Elements appears to ignore types in its matching, so we follow suit.
+  #items.each { |item|
+  #  if item.typeName != cand.typeName
+  #    if !item.isFromElements && !cand.isFromElements
+  #      #puts "Type-id mismatch for scheme #{scheme.inspect}: #{cand.typeName.inspect} vs #{item.typeName.inspect}"
+  #      ok = false
+  #    end
+  #  end
+  #}
 
   # Make sure the candidate overlaps at least one author of every pub in the set
   items.each { |item|
@@ -171,6 +176,7 @@ def isCompatible(items, cand)
   # Make sure the candidate has no conflicting IDs
   cand.ids.each { |scheme, text|
     next if isCampusID(scheme)   # we know that campus IDs overlap each other, and that's expected
+    next if scheme=="elements"   # we also know that Elements IDs can overlap and that's expected
     if ids.include?(scheme) && ids[scheme] != text
       #puts "ID mismatch for scheme #{scheme.inspect}: #{text.inspect} vs #{ids[scheme].inspect}"
       ok = false
@@ -355,14 +361,23 @@ def groupItems()
   # Process each key
   postNum = 0
   allKeys.each_with_index { |docKey, index|
+
     # Clear out the title count hash so we don't eat memory
     $titleCount = Hash.new{|h, k| h[k] = 0 }
 
     # Read in the items with this doc key, and count their titles
     items = []
     anyCampus = false
+    elemType = nil
     db_execute("SELECT item_data FROM raw_items WHERE doc_key = ?", docKey).each { |row|
       item = Marshal.load(row[0])
+
+      # Filter out campus IDs from Elements items, otherwise they'd cause mismatches
+      if item.isFromElements
+        item.ids.reject! { |scheme, id| isCampusID(scheme) }
+      end
+
+      # Keep track of any campus IDs remaining
       anyCampus ||= (item.campusIDs.length > 0)
       $titleCount[item.title] += 1
       items << item
@@ -427,19 +442,27 @@ def groupItems()
             (pub.userPropIds ||= Set.new) << propId
           end
         }
+        if item.suggestions
+          item.suggestions.each { |email|
+            propId = $emailToElementsUser[email]
+            if propId
+              (pub.suggEmails ||= Set.new) << email
+              (pub.suggPropIds ||= Set.new) << propId
+            end
+          }
+        end
       }
 
       # If no user ids, there's no point in uploading the item
-      pub.userPropIds or next
+      pub.userPropIds or pub.suggPropIds or next
 
       # If only doing one campus, skip everything else.
       if $onlyCampus
         next unless pub.items.any?{ |item| item.campusIDs.any?{ |scheme,id| scheme == "c-#{$onlyCampus}-id" }}
       end
 
-      if $onlyElem
-        next unless pub.items.any? { |item| item.ids.any? { |scheme,id| scheme == "elements" } && item.campusIDs.length == 0 }
-      end
+      # Skip items with no campus ids (probably unmatched Elements records)
+      next if pub.items.none? { |item| item.campusIDs.length > 0 }
 
       # Queue it.
       postNum += 1
@@ -453,7 +476,6 @@ end
 # Mint a new OAP identifier
 def mintOAPID(metadata)
   if $testMode
-    puts "(test mode: inventing something random rather than calling EZID)"
     return "ark:/13030/fk#{(0...8).map { (65 + rand(26)).chr }.join}"
   else
     resp = $ezidSession.mint(metadata)
@@ -497,7 +519,7 @@ end
 def makeRecordToPut(item, dedupedIds)
   Nokogiri::XML::Builder.new { |xml|
     xml.send('import-record', 'xmlns' => "http://www.symplectic.co.uk/publications/api", 
-             'type-id' => $typeNameToID[item.typeName]) { # 2 = book, 3 = chapter, 4 = conference, 5 = journal-article
+             'type-id' => $typeNameToID[item.typeName]) { # 2 = book, 3 = chapter, 4 = conference, 5 = journal-article, etc.
       xml.native {
 
         # Title, author, journal/vol/iss, and date all taken from a single item chosen as the "best"
@@ -530,7 +552,7 @@ def makeRecordToPut(item, dedupedIds)
             xml.field(name: 'doi') { xml.text_ idsByScheme['doi'][0] }
           elsif isCampusID(scheme)
             xml.field(name: scheme) { xml.text_ ids.join(', ') }
-          else
+          elsif scheme != 'elements'
             ids.length == 1 or raise("cannot have #{ids.length} #{scheme} IDs in a record")
             extIds[scheme] = ids
           end
@@ -539,7 +561,6 @@ def makeRecordToPut(item, dedupedIds)
           xml.field(name: 'external-identifiers') {
             xml.identifiers {
               extIds.each { |scheme, ids|
-                next if scheme == 'elements'
                 scheme == 'pmid' and scheme = 'pubmed'   # map pmid -> pubmed
                 xml.identifier(scheme: scheme) { xml.text ids[0] }
               }
@@ -717,9 +738,10 @@ def printPub(postNum, pub, oapID)
     puts "Post \##{postNum}:"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-      puts "  INFO: #{item.title.inspect} [#{item.typeName}]"
+      puts "  INFO: #{item.title} [#{item.typeName}]"
       puts "  INFO:     #{item.date ? item.date : '<no date>'}     #{item.authors.join('; ').gsub('|;', ';')}"
       puts "  INFO:     #{idStr}"
+      item.suggestions and puts "  INFO:     Sugg: #{item.suggestions}"
     }
     oapID and puts "  OAP ID: #{oapID}"
     return true
@@ -787,6 +809,117 @@ def checkNewAssoc(scheme, campusID, oapID, campusCache)
 end
 
 ###################################################################################################
+# This gets called in the fairly uncommon case where one or more campus items are switching from
+# one OAP ID to another. Usually this is a case of the old matching logic having created dupes,
+# and the new matching logic doing better de-duping.
+#
+# If the old OAP ID is being completely abandoned, and the users haven't done anything to it in
+# Elements (i.e. they haven't uploaded a file or associated an OA URL), then we can safely delete
+# the old OAP ID.
+def handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
+
+  # Collate the records by old OAP ID
+  fromOAPs = Hash.new { |h,k| h[k] = Set.new }
+  assocChanges.each { |campusID, fromOAP, toOAP| fromOAPs[fromOAP] << campusID }
+
+  # Figure out which old OAP IDs will end up abandoned
+  abandoned = []
+  fromOAPs.each { |fromOAP, campusIDs|
+    existing = Set.new(db_execute("SELECT campus_id FROM ids WHERE oap_id = ?", fromOAP).map { |row| row[0] })
+    if existing == campusIDs
+      abandoned << fromOAP
+    end
+  }
+
+  # Ensure that all IDs being abandoned haven't been worked on by the users
+  errs = []
+  abandoned.each { |fromOAP|
+    pubs = db_execute("SELECT pub_id FROM pubs WHERE oap_id = ?", fromOAP).map { |row| row[0] }
+    pubs.each { |pubID|
+      n = db_get_first_value("SELECT count(*) FROM eschol_equiv WHERE pub_id = ?", pubID)
+      if n > 0
+        errs << "An eschol_equiv record is associated with publication #{pubID}, OAP #{fromOAP}."
+      end
+      n = $arkDb.get_first_value("SELECT count(*) FROM arks WHERE source = ? AND external_id = ?", "elements", pubID)
+      if n > 0
+        errs << "A file was deposited to eschol for publication #{pubID}, OAP #{fromOAP}."
+      end
+    }
+  }
+
+  if !errs.empty?
+    puts "Warning: The following association change will *not* be performed because of potential problems."
+    assocChanges.each { |campusID, fromOAP, toOAP|
+      puts "  Change: Campus item #{campusID} switching from oapID #{fromOAP} to #{toOAP}."
+    }
+    errs.each { |err|
+      puts "  Potential problem: #{err}"
+    }
+    return false
+  end
+
+  puts "Note: The following association change appears to be OK, going ahead."
+  if !abandoned.empty?
+    puts "  Abandoned IDs: #{abandoned.inspect}"
+  end
+  assocChanges.each { |campusID, fromOAP, toOAP|
+    puts "  Change: Campus item #{campusID} switching from oapID #{fromOAP} to #{toOAP}."
+  }
+
+  # Make the changes in the database
+  assocChanges.each { |campusID, fromOAP, toOAP|
+    db_execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", [campusID, toOAP])
+  }
+
+  # Drop the old OAP record in Elements
+  if $testMode
+    puts "  (test mode: not deleting old OAP item)"
+  else
+    abandoned.each { |fromOAP|
+      puts "  Deleting abanonded record #{fromOAP.inspect}."
+      uri = URI("#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}")
+      req = Net::HTTP::Delete.new(uri)
+      req.basic_auth $apiCred[0], $apiCred[1]
+      (1..10).each { |tryNumber|
+
+        $transLog.write("\n---------------------------------------------------------------\n")
+        $transLog.write("\nDELETE #{uri}\n\n")
+        $transLog.write(toPut)
+        $transLog.flush
+
+        res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
+          http.request req
+        }
+
+        # Log the response
+        $transLog.write("\nResponse:\n")
+        $transLog.write("#{res}\n")
+        $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
+
+        # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
+        if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
+          puts "  Note: failed due to #{res} (likely a transitory concurrency issue)."
+          if tryNumber < 20
+            puts "  Will retry after a 30-second pause."
+            sleep 30
+            next
+          else
+            puts "  Out of retries. Aborting."
+          end  
+        end
+
+        # Fail if the DELETE failed
+        res.is_a?(Net::HTTPSuccess) or raise("Error: delete failed: #{res}")
+      }
+    }
+  end
+
+  # All done, and ready to proceed with import.
+  return true
+
+end
+
+###################################################################################################
 # Generate an OAP ID for this publication, then queue it for import.
 def mintPub(postNum, pub)
 
@@ -798,18 +931,26 @@ def mintPub(postNum, pub)
   campusIDs = pub.items.map { |item| item.campusIDs }.flatten(1).uniq
 
   # For existing groups, we'll already have an identifier in the database. Re-use it.
-  oapID = nil
+  foundOaps = Set.new
   campusToOAP = Hash.new{|h, k| h[k] = Hash.new }
   campusIDs.each { |scheme, id|
     old_oapID = db_get_first_value("SELECT oap_id FROM ids WHERE campus_id = ?", "#{scheme}::#{id}")
+    if old_oapID
+      joined = db_get_first_value("SELECT isJoinedRecord FROM oap_flags WHERE oap_id = ?", old_oapID)
+      foundOaps << [joined, old_oapID]
+    end
     campusToOAP[scheme][id] = old_oapID
     oapID ||= old_oapID
   }
+  # If there are multiple OAP IDs, prefer the one that was joined, in case we're going to delete the other.
+  oapID = foundOaps.empty? ? nil : foundOaps.sort()[-1][1]
 
   # If we can't find one, mint a new one.
   if not oapID
     idStr = ids.to_a.map { |scheme, id| "#{scheme}::#{id}" }.join(' ')
-    puts "[Minting new OAP ID for upcoming post #{postNum}]"
+    if not $testMode
+      puts "[Minting new OAP ID for upcoming post #{postNum}]"
+    end
     # Determine the EZID metadata
     meta = { 'erc.what' => normalizeERC("Grouped OA Publication record for '#{bestItem.title}' [IDs #{idStr}]"),
              'erc.who'  => normalizeERC(bestItem.authors.map { |auth| auth.split("|")[0] }.join('; ')),
@@ -821,15 +962,15 @@ def mintPub(postNum, pub)
   # Associate this OAP identifier with all the item IDs so that in future this group will reliably
   # receive the same identifier.
   campusCache = Hash.new { |h,k| h[k] = Set.new }
+  assocChanges = nil
   campusIDs.each { |scheme, id|
     if campusToOAP[scheme] && campusToOAP[scheme][id]
       if campusToOAP[scheme][id] == oapID
         checkNewAssoc(scheme, id, oapID, campusCache)
         # Unchanged association - don't need to update db
       else
-        puts "Warning: campus ID #{scheme}::#{id} is switching from oapID #{campusToOAP[scheme][id]} to #{oapID}"
+        (assocChanges ||= Array.new) << ["#{scheme}::#{id}", campusToOAP[scheme][id], oapID]
         checkNewAssoc(scheme, id, oapID, campusCache)
-        db_execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
       end
     else
       # New association - add it to the db
@@ -838,6 +979,23 @@ def mintPub(postNum, pub)
       db_execute("INSERT INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
     end
   }
+
+  if $onlyElem
+    elemID = nil
+    ids.each { |scheme, id| scheme == "elements" and elemID = id }
+    elemID or return
+    existingPubID = db_get_first_value("SELECT pub_id FROM pubs WHERE oap_id = ?", oapID)
+    return if existingPubID
+    printPub(postNum, pub, oapID)
+  end
+
+  puts "  (just fooling around, not inserting records)"
+  return false
+
+  # Special handling of items hopping from one OAP pub to another
+  if assocChanges
+    return unless handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
+  end
 
   # Ready for import
   $importQueue << [postNum, pub, ids, bestItem, oapID]
@@ -903,8 +1061,6 @@ def importPub(postNum, pub, ids, bestItem, oapID)
   end
 
   $transLog.flush
-  print "Exiting early."
-  exit 1
   #print "Record done. Hit Enter to do another: "
   #STDIN.gets
 end

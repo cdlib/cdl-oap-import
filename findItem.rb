@@ -114,13 +114,16 @@ end
 ###################################################################################################
 def isCampusID(id)
   id.length >= 5 or return false
-  return $oapDb.get_first_value("SELECT COUNT(*) FROM ids WHERE campus_id LIKE ?", "%#{id}%") == 1
+  return $oapDb.get_first_value("SELECT COUNT(*) FROM ids WHERE campus_id = ?", id) == 1 \
+      || $oapDb.get_first_value("SELECT COUNT(*) FROM ids WHERE campus_id LIKE ?", "%::#{id}") == 1
 end
 
 ###################################################################################################
 # Try different ways to make the ID into a valid Elements publication ID
 def toCampusID(id)
-  campusID = $oapDb.get_first_value("SELECT campus_id FROM ids WHERE campus_id LIKE ?", "%#{id}%")
+  campusID = $oapDb.get_first_value("SELECT campus_id FROM ids WHERE campus_id = ?", id)
+  return campusID if campusID
+  campusID = $oapDb.get_first_value("SELECT campus_id FROM ids WHERE campus_id LIKE ?", "%::#{id}")
   return campusID if campusID
   return nil
 end
@@ -163,7 +166,7 @@ def printPub(id)
   anyFlags = false
   $oapDb.execute("SELECT isJoinedRecord, isElemCompat FROM oap_flags WHERE oap_id = ?", oapID).each { |flags|
     if flags[0] == 1
-      puts "    Joined to harvested records in Elements. Compatibly=#{flags[1]==1 ? 'yes' : 'no'}"
+      puts "    Joined to harvested record in Elements. Compatibly=#{flags[1]==1 ? 'yes' : 'no'}"
     else
       puts "    Not joined"
     end
@@ -176,8 +179,8 @@ def printPub(id)
   # Print import hash info
   anyImports = false
   $oapDb.execute("SELECT updated, oap_users FROM oap_hashes WHERE oap_id = ?", oapID).each { |imports|
-    puts "    Updated to Elements: #{imports[0]}"
-    puts "    Users in Elements  : #{imports[1].split("|").join(", ")}"
+    #puts "    Updated to Elements: #{imports[0]}"
+    #puts "    Users in Elements  : #{imports[1].split("|").join(", ")}"
     anyImports = true
   }
   if !anyImports
@@ -197,6 +200,7 @@ def printPub(id)
     puts "    #{campusID}"
     if $oapDb.get_first_value("SELECT COUNT(*) FROM raw_items WHERE campus_id = ?", campusID) == 1
       item = RawItem.load(campusID.split("::"))
+      puts "      type : #{item.typeName.inspect}"
       puts "      title: #{item.title.inspect}"
     else
       puts "      NOTE: can't find raw_item."
@@ -211,6 +215,7 @@ end
 ###################################################################################################
 def main
   ARGV.each { |arg|
+    next if arg.length <= 5
     puts "-----------------------------------------------------------------------------------------------"
     puts "Identifying #{arg.inspect}."
     tmp = toEscholArk(arg)
