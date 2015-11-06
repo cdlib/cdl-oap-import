@@ -24,7 +24,15 @@ CREATE TABLE emails (
   proprietary_id    TEXT NOT NULL
 );
 
-CREATE INDEX proprietary_id ON emails(proprietary_id);
+CREATE INDEX email_proprietary_id ON emails(proprietary_id);
+
+-- Table of username -> proprietary ID. 
+CREATE TABLE usernames (
+  username          TEXT PRIMARY KEY NOT NULL,
+  proprietary_id    TEXT NOT NULL
+);
+
+CREATE INDEX username_proprietary_id ON usernames(proprietary_id);
 
 -- Table of Elements publication ID -> OAP ID. This is always 1-to-1
 CREATE TABLE pubs (

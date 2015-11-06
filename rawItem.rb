@@ -70,6 +70,7 @@ $typeIdToName = { 2 => 'book',
                   53 => 'presentation'
                 }
 $typeNameToID = $typeIdToName.invert
+$typeNameToID['software'] = 8  # Alternative spelling
 
 ###################################################################################################
 # Monkey patches to make Nokogiri even more elegant

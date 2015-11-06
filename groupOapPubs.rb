@@ -44,7 +44,8 @@ end
 # Global variables
 $titleCount = Hash.new{|h, k| h[k] = 0 }
 $authKeys = Hash.new{|h, k| h[k] = calcAuthorKeys(k) }
-$emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUser(k) }
+$emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsEmail(k) }
+$usernameToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUsername(k) }
 $credentials = nil
 if $testMode
   puts "\n*** TEST MODE: No IDs will be minted, no actual posts will be made. ***\n"
@@ -82,6 +83,8 @@ $elementsUI = case $hostname
   else 'http://unknown-host'
 end
 $elementsAPI = "#{$elementsUI}:8002/elements-secure-api"
+$elementsAPIConn = nil
+$elementsAPIMutex = Mutex.new
 
 # We need to identify recurring series items and avoid grouping them. Best way seems to be just by title.
 seriesTitles = [
@@ -348,8 +351,13 @@ def db_execute(stmt, *more)
 end
 
 ###################################################################################################
-def lookupElementsUser(email)
+def lookupElementsEmail(email)
   return db_get_first_value("SELECT proprietary_id FROM emails WHERE email = ?", email)
+end
+
+###################################################################################################
+def lookupElementsUsername(username)
+  return db_get_first_value("SELECT proprietary_id FROM usernames WHERE username = ?", username)
 end
 
 ###################################################################################################
@@ -444,7 +452,7 @@ def groupItems()
         }
         if item.suggestions
           item.suggestions.each { |email|
-            propId = $emailToElementsUser[email]
+            propId = $usernameToElementsUser[email]
             if propId
               (pub.suggEmails ||= Set.new) << email
               (pub.suggPropIds ||= Set.new) << propId
@@ -454,6 +462,7 @@ def groupItems()
       }
 
       # If no user ids, there's no point in uploading the item
+      #pub.userPropIds or pub.suggPropIds or puts("...skipping due to no users")
       pub.userPropIds or pub.suggPropIds or next
 
       # If only doing one campus, skip everything else.
@@ -617,13 +626,11 @@ def putRecord(pub, oapID, toPut)
   req.body = toPut
   (1..10).each { |tryNumber|
     puts "  Putting record."
-    res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
-      http.request req
-    }
+    res = $elementsAPIConn.request(req)
 
     # Log the response
     $transLog.write("\nResponse:\n")
-    $transLog.write("#{res}\n")
+    $transLog.write("#{res} code=#{res.code} message=#{res.message.inspect}\n")
     $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
 
     # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
@@ -703,13 +710,11 @@ def postRelationship(oapID, userPropID)
     req['Content-Type'] = 'text/xml'
     req.basic_auth $apiCred[0], $apiCred[1]
     req.body = toPost
-    res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
-      http.request req
-    }
+    res = $elementsAPIConn.request(req)
 
     # Log the response
     $transLog.write("\nResponse:\n")
-    $transLog.write("#{res}\n")
+    $transLog.write("#{res} code=#{res.code} message=#{res.message.inspect}\n")
     $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
 
     # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
@@ -866,57 +871,67 @@ def handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
     puts "  Change: Campus item #{campusID} switching from oapID #{fromOAP} to #{toOAP}."
   }
 
-  # Make the changes in the database
+  # Drop the old OAP record in Elements
+  abandoned.each { |fromOAP|
+    puts "  Deleting abanonded record #{fromOAP.inspect}."
+    if $testMode
+      puts "    (test mode: not deleting old OAP item)"
+      next
+    end
+    uri = URI("#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(fromOAP)}")
+    req = Net::HTTP::Delete.new(uri)
+    req.basic_auth $apiCred[0], $apiCred[1]
+    (1..10).each { |tryNumber|
+
+      $transLog.write("\n---------------------------------------------------------------\n")
+      $transLog.write("\nDELETE #{uri}\n")
+      $transLog.flush
+
+      res = $elementsAPIConn.request(req)
+
+      # Log the response
+      $transLog.write("Response:\n")
+      $transLog.write("#{res} code=#{res.code} message=#{res.message.inspect}\n")
+      $transLog.write("#{res.body}\n")
+
+      # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
+      if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
+        puts "  Note: failed due to #{res} (likely a transitory concurrency issue)."
+        if tryNumber < 20
+          puts "  Will retry after a 30-second pause."
+          sleep 30
+          next
+        else
+          puts "  Out of retries. Aborting."
+        end  
+      end
+
+      # Fail if the DELETE failed
+      res.is_a?(Net::HTTPSuccess) or raise("Error: delete failed: #{res}")
+    }
+  }
+
+  # Make the changes in our database
   assocChanges.each { |campusID, fromOAP, toOAP|
     db_execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", [campusID, toOAP])
   }
 
-  # Drop the old OAP record in Elements
-  if $testMode
-    puts "  (test mode: not deleting old OAP item)"
-  else
-    abandoned.each { |fromOAP|
-      puts "  Deleting abanonded record #{fromOAP.inspect}."
-      uri = URI("#{$elementsAPI}/publication/records/c-inst-1/#{CGI.escape(oapID)}")
-      req = Net::HTTP::Delete.new(uri)
-      req.basic_auth $apiCred[0], $apiCred[1]
-      (1..10).each { |tryNumber|
-
-        $transLog.write("\n---------------------------------------------------------------\n")
-        $transLog.write("\nDELETE #{uri}\n\n")
-        $transLog.write(toPut)
-        $transLog.flush
-
-        res = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') { |http|
-          http.request req
-        }
-
-        # Log the response
-        $transLog.write("\nResponse:\n")
-        $transLog.write("#{res}\n")
-        $transLog.write("#{res.body.start_with?('<?xml') ? Nokogiri::XML(res.body, &:noblanks).to_xml : res.body}\n")
-
-        # HTTPConflict and HTTPGatewayTimeOut happen occasionally, and are likely transitory
-        if res.is_a?(Net::HTTPConflict) || res.is_a?(Net::HTTPGatewayTimeOut)
-          puts "  Note: failed due to #{res} (likely a transitory concurrency issue)."
-          if tryNumber < 20
-            puts "  Will retry after a 30-second pause."
-            sleep 30
-            next
-          else
-            puts "  Out of retries. Aborting."
-          end  
-        end
-
-        # Fail if the DELETE failed
-        res.is_a?(Net::HTTPSuccess) or raise("Error: delete failed: #{res}")
-      }
-    }
-  end
-
   # All done, and ready to proceed with import.
   return true
 
+end
+
+###################################################################################################
+# See if the given item is matched with a record from in elements but doesn't yet have a pub_id
+def isOnlyElem(ids, oapID)
+  elemID = nil
+  ids.each { |scheme, id| scheme == "elements" and elemID = id }
+  #elemID or puts("skipping due to no elements")
+  elemID or return false
+  existingPubID = db_get_first_value("SELECT pub_id FROM pubs WHERE oap_id = ?", oapID)
+  #puts("skipping due to existing pub") if existingPubID
+  existingPubID and return false
+  return true
 end
 
 ###################################################################################################
@@ -981,20 +996,14 @@ def mintPub(postNum, pub)
   }
 
   if $onlyElem
-    elemID = nil
-    ids.each { |scheme, id| scheme == "elements" and elemID = id }
-    elemID or return
-    existingPubID = db_get_first_value("SELECT pub_id FROM pubs WHERE oap_id = ?", oapID)
-    return if existingPubID
-    printPub(postNum, pub, oapID)
+    return unless isOnlyElem(ids, oapID)
   end
-
-  puts "  (just fooling around, not inserting records)"
-  return false
 
   # Special handling of items hopping from one OAP pub to another
   if assocChanges
-    return unless handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
+    $elementsAPIMutex.synchronize {
+      return unless handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
+    }
   end
 
   # Ready for import
@@ -1025,17 +1034,19 @@ def importPub(postNum, pub, ids, bestItem, oapID)
 
   # Now associate this record with each author we haven't associated before
   anyNewUsers = false
-  oldUsers = db_get_first_value('SELECT oap_users FROM oap_hashes WHERE oap_id = ?', oapID)
-  oldUsers = Set.new(oldUsers ? oldUsers.split('|') : []) 
-  pub.userPropIds.each { |userPropID|
-    if !$forceMode && oldUsers.include?(userPropID)
-      #puts "  Skip: User #{userPropID} already associated."
-    else
-      printed ||= printPub(postNum, pub, oapID)
-      postRelationship(oapID, userPropID)
-      anyNewUsers = true
-    end
-  }
+  if pub.userPropIds
+    oldUsers = db_get_first_value('SELECT oap_users FROM oap_hashes WHERE oap_id = ?', oapID)
+    oldUsers = Set.new(oldUsers ? oldUsers.split('|') : [])
+    pub.userPropIds.each { |userPropID|
+      if !$forceMode && oldUsers.include?(userPropID)
+        #puts "  Skip: User #{userPropID} already associated."
+      else
+        printed ||= printPub(postNum, pub, oapID)
+        postRelationship(oapID, userPropID)
+        anyNewUsers = true
+      end
+    }
+  end
 
   # Keep our database up-to-date in terms of what's been sent already to Elements, so we can avoid
   # re-doing work in the future.
@@ -1081,7 +1092,9 @@ def processImports
   loop do
     (postNum, pub, ids, bestItem, oapID) = $importQueue.pop
     break if postNum == "END"
-    importPub(postNum, pub, ids, bestItem, oapID)
+    $elementsAPIMutex.synchronize {
+      importPub(postNum, pub, ids, bestItem, oapID)
+    }
     if (postNum % 1000) == 0
       puts "Checked #{postNum} posts."
     end
@@ -1112,6 +1125,10 @@ def main
 
   # Need credentials for talking to the Elements API
   ($apiCred = Netrc.read[URI($elementsAPI).host]) or raise("Need credentials for #{URI($elementsAPI).host} in ~/.netrc")
+
+  # Connect to the Elements API
+  uri = URI($elementsAPI)
+  $elementsAPIConn = Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https')
 
   # Read the primary data, parse it, and build our hashes
   puts "Building item caches."

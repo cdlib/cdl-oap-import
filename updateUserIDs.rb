@@ -32,6 +32,8 @@ def updateEmails(filename, db)
     record.name == 'record' or raise("Unknown record type '#{record.name}'")
     email = record.text_at("field[@name='[Email]']") or raise("Record missing email field: #{record}")
     email = email.downcase.strip
+    username = record.text_at("field[@name='[Username]']") or raise("Record missing username field: #{record}")
+    username = username.downcase.strip
     propID = record.text_at("field[@name='[Proprietary_ID]']") or raise("Record missing proprietary ID field: #{record}")
 
     # Experiment: change foo@dept.ucla.edu to foo@ucla.edu
@@ -46,11 +48,22 @@ def updateEmails(filename, db)
     if existing == propID
       #puts "No update for #{email} -> #{propID}"
     elsif existing
-      puts "Update #{email}: old=#{existing} new=#{propID}"
+      puts "Update email #{email}: old=#{existing} new=#{propID}"
       db.execute("UPDATE emails SET proprietary_id = ? WHERE email = ?", [propID, email])
     else
-      puts "Insert #{email} -> #{propID}"
+      puts "Insert email #{email} -> #{propID}"
       db.execute("INSERT INTO emails VALUES (?,?)", [email, propID])
+    end
+
+    existing = db.get_first_value("SELECT proprietary_id FROM usernames WHERE username=?", [username])
+    if existing == propID
+      #puts "No update for #{username} -> #{propID}"
+    elsif existing
+      puts "Update username #{username}: old=#{existing} new=#{propID}"
+      db.execute("UPDATE usernames SET proprietary_id = ? WHERE username = ?", [propID, username])
+    else
+      puts "Insert username #{username} -> #{propID}"
+      db.execute("INSERT INTO usernames VALUES (?,?)", [username, propID])
     end
   }
 end
