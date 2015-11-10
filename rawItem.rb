@@ -145,7 +145,7 @@ def elemNativeToRawItem(native, typeName, updated)
 
   # Title parsing and doc key generation
   title = normalize(native.text_at("field[@name='title']/text"))
-  docKey = filterTitle(title).join(' ')
+  docKey = filterTitle(title).join
 
   # Author parsing
   authors = native.xpath("field[@name='authors']/people/person").map { |person|

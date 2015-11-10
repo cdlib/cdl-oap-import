@@ -60,8 +60,8 @@ $arkDb = SQLite3::Database.new("/apps/eschol/erep/xtf/control/db/arks.db")
 $arkDb.busy_timeout = 30000
 $transLog = nil
 $reportFile = nil
-$mintQueue = SizedQueue.new(100)
-$importQueue = SizedQueue.new(100)
+$mintQueue = SizedQueue.new($testMode ? 1 : 100)
+$importQueue = SizedQueue.new($testMode ? 1 : 100)
 
 # Structure for holding a group of duplicate items
 OAPub = Struct.new(:items, :userEmails, :userPropIds, :suggEmails, :suggPropIds)
@@ -279,7 +279,6 @@ def buildItemCache(filename)
   existing = db_get_first_value("SELECT COUNT(*) FROM raw_items WHERE campus_id LIKE ? AND updated >= ?",
                                 "c-#{campus}-id::%", File.mtime(filename).to_i)
   return if existing > 0
-  puts "#{campus}: existing timestamp=#{existing} wanted=#{File.mtime(filename).to_i}"
 
   # Blow away any existing raw item records for this campus, since we're going to re-insert them.
   db_execute("DELETE FROM raw_items WHERE campus_id LIKE ?", "c-#{campus}-id::%")
@@ -361,8 +360,34 @@ def lookupElementsUsername(username)
 end
 
 ###################################################################################################
+# Temporary to faciliate switching from spaces in doc keys to no spaces (e.g. so that "U.S." and
+# "US" will end up equivalent)
+def removeSpacesFromDocKeys()
+  todo = []
+  db_execute("SELECT campus_id, doc_key FROM raw_items WHERE doc_key LIKE ?", "% %").each { |row|
+    todo << [row[0], row[1]]
+  }
+  todo.empty? and return
+
+  puts("Removing spaces from doc keys.")
+  db_execute("begin")
+  nDone = 0
+  todo.each { |campusID, oldDocKey|
+    (nDone % 10000) == 0 and puts "  Fixed #{nDone}/#{todo.length} doc keys."
+    nDone += 1
+    newDocKey = oldDocKey.gsub(' ', '')
+    db_execute("UPDATE raw_items SET doc_key = ? WHERE campus_id = ?", [newDocKey, campusID])
+  }
+  db_execute("commit")
+  puts "  Fixed #{nDone}/#{todo.length} doc keys."
+end
+
+###################################################################################################
 # For items with a matching title key, group together by overlapping authors to form the OA Pubs.
 def groupItems()
+  # During transition, make sure doc keys don't have spaces in them.
+  removeSpacesFromDocKeys
+
   # Grab all the distinct doc keys
   allKeys = db_execute("SELECT DISTINCT doc_key FROM raw_items").map { |row| row[0] }
 
@@ -398,11 +423,12 @@ def groupItems()
     next if items.empty?
 
     # If there are 5 or more dates involved, this is probably a series thing.
-    numDates = items.map{ |info| info.date }.uniq.length
+    numDates = items.reject{ |info| info.isFromElements }.map{ |info| info.date }.uniq.length
 
     # Singleton cases.
     pubs = []
     if docKey == "" || items.length == 1 || numDates >= 5 || isSeriesTitle(items[0].title)
+      #puts "Singleton case: items.length=#{items.length} numDates=#{numDates} dates=#{items.map{ |info| info.date }.uniq} isSeriesTitle=#{isSeriesTitle(items[0].title)}"
       if numDates >= 5
         if !isSeriesTitle(items[0].title)
           #puts "Probable series (#{numDates} dates): #{items[0].title}"
@@ -827,27 +853,29 @@ def handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
   fromOAPs = Hash.new { |h,k| h[k] = Set.new }
   assocChanges.each { |campusID, fromOAP, toOAP| fromOAPs[fromOAP] << campusID }
 
-  # Figure out which old OAP IDs will end up abandoned
+  # Figure out which old OAP IDs will end up abandoned, and which are being disassociated
   abandoned = []
   fromOAPs.each { |fromOAP, campusIDs|
     existing = Set.new(db_execute("SELECT campus_id FROM ids WHERE oap_id = ?", fromOAP).map { |row| row[0] })
-    if existing == campusIDs
+    if (existing - campusIDs).empty?
       abandoned << fromOAP
     end
   }
 
-  # Ensure that all IDs being abandoned haven't been worked on by the users
+  disassoc = assocChanges.map{ |campusID, fromOAP, toOAP| toOAP ? nil : fromOAP }.compact
+
+  # Ensure that all IDs being abandoned or disassociated haven't been worked on by the users
   errs = []
-  abandoned.each { |fromOAP|
+  (abandoned+disassoc).each { |fromOAP|
     pubs = db_execute("SELECT pub_id FROM pubs WHERE oap_id = ?", fromOAP).map { |row| row[0] }
     pubs.each { |pubID|
       n = db_get_first_value("SELECT count(*) FROM eschol_equiv WHERE pub_id = ?", pubID)
       if n > 0
-        errs << "An eschol_equiv record is associated with publication #{pubID}, OAP #{fromOAP}."
+        errs << "An eschol_equiv record is associated with publication #{pubID.inspect}, OAP #{fromOAP.inspect}."
       end
       n = $arkDb.get_first_value("SELECT count(*) FROM arks WHERE source = ? AND external_id = ?", "elements", pubID)
       if n > 0
-        errs << "A file was deposited to eschol for publication #{pubID}, OAP #{fromOAP}."
+        errs << "A file was deposited to eschol for publication #{pubID.inspect}, OAP #{fromOAP.inspect}."
       end
     }
   }
@@ -855,7 +883,11 @@ def handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
   if !errs.empty?
     puts "Warning: The following association change will *not* be performed because of potential problems."
     assocChanges.each { |campusID, fromOAP, toOAP|
-      puts "  Change: Campus item #{campusID} switching from oapID #{fromOAP} to #{toOAP}."
+      if toOAP
+        puts "  Change: Campus item #{campusID} switching from oapID #{fromOAP.inspect} to #{toOAP.inspect}."
+      else
+        puts "  Change: Campus item #{campusID} leaving oapID #{fromOAP.inspect}."
+      end
     }
     errs.each { |err|
       puts "  Potential problem: #{err}"
@@ -868,12 +900,16 @@ def handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
     puts "  Abandoned IDs: #{abandoned.inspect}"
   end
   assocChanges.each { |campusID, fromOAP, toOAP|
-    puts "  Change: Campus item #{campusID} switching from oapID #{fromOAP} to #{toOAP}."
+    if toOAP
+      puts "  Change: Campus item #{campusID} switching from oapID #{fromOAP.inspect} to #{toOAP.inspect}."
+    else
+      puts "  Change: Campus item #{campusID} leaving oapID #{fromOAP.inspect}."
+    end
   }
 
   # Drop the old OAP record in Elements
   abandoned.each { |fromOAP|
-    puts "  Deleting abanonded record #{fromOAP.inspect}."
+    puts "  Deleting abandoned record #{fromOAP.inspect}."
     if $testMode
       puts "    (test mode: not deleting old OAP item)"
       next
@@ -913,7 +949,17 @@ def handleAssocChanges(postNum, pub, ids, oapID, assocChanges)
 
   # Make the changes in our database
   assocChanges.each { |campusID, fromOAP, toOAP|
-    db_execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", [campusID, toOAP])
+    if toOAP
+      db_execute("INSERT OR REPLACE INTO ids (campus_id, oap_id) VALUES (?, ?)", [campusID, toOAP])
+    else
+      db_execute("DELETE FROM ids WHERE campus_id = ? AND oap_id = ?", [campusID, fromOAP])
+    end
+  }
+  abandoned.each { |fromOAP|
+    db_execute("DELETE FROM ids WHERE oap_id = ?", fromOAP)
+    db_execute("DELETE FROM pubs WHERE oap_id = ?", fromOAP)
+    db_execute("DELETE FROM oap_hashes WHERE oap_id = ?", fromOAP)
+    db_execute("DELETE FROM oap_flags WHERE oap_id = ?", fromOAP)
   }
 
   # All done, and ready to proceed with import.
@@ -938,12 +984,13 @@ end
 # Generate an OAP ID for this publication, then queue it for import.
 def mintPub(postNum, pub)
 
-  # Pick the best item for its metadata
-  bestItem = pub.items.inject { |memo, item| isBetterItem(item, memo) ? item : memo }
+  # Pick the best item for its metadata (don't consider Elements metadata)
+  nonElemItems = pub.items.reject { |item| item.isFromElements }
+  bestItem = nonElemItems.inject { |memo, item| isBetterItem(item, memo) ? item : memo }
 
   # Combine all the identifiers and remove duplicates
-  ids = pub.items.map { |item| item.ids }.flatten(1).uniq
-  campusIDs = pub.items.map { |item| item.campusIDs }.flatten(1).uniq
+  ids = nonElemItems.map { |item| item.ids }.flatten(1).uniq
+  campusIDs = nonElemItems.map { |item| item.campusIDs }.flatten(1).uniq
 
   # For existing groups, we'll already have an identifier in the database. Re-use it.
   foundOaps = Set.new
@@ -952,7 +999,7 @@ def mintPub(postNum, pub)
     old_oapID = db_get_first_value("SELECT oap_id FROM ids WHERE campus_id = ?", "#{scheme}::#{id}")
     if old_oapID
       joined = db_get_first_value("SELECT isJoinedRecord FROM oap_flags WHERE oap_id = ?", old_oapID)
-      foundOaps << [joined, old_oapID]
+      foundOaps << [joined ? 1 : 0, old_oapID]
     end
     campusToOAP[scheme][id] = old_oapID
     oapID ||= old_oapID
@@ -992,6 +1039,14 @@ def mintPub(postNum, pub)
       checkNewAssoc(scheme, id, oapID, campusCache)
       #puts "  Inserting new OAP ID."
       db_execute("INSERT INTO ids (campus_id, oap_id) VALUES (?, ?)", ["#{scheme}::#{id}", oapID])
+    end
+  }
+
+  # Dissociate any item IDs that aren't in this group
+  checkAgainst = campusIDs.map { |scheme, id| "#{scheme}::#{id}" }
+  db_execute("SELECT campus_id FROM ids WHERE oap_id = ?", oapID).each { |row|
+    if !checkAgainst.include?(row[0])
+      (assocChanges ||= Array.new) << [row[0], oapID, nil]
     end
   }
 
