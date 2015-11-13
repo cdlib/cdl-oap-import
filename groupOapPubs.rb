@@ -402,7 +402,7 @@ def groupItems()
     items = []
     anyCampus = false
     elemType = nil
-    db_execute("SELECT item_data FROM raw_items WHERE doc_key = ?", docKey).each { |row|
+    db_execute("SELECT item_data FROM raw_items WHERE doc_key = ? ORDER BY campus_id", docKey).each { |row|
       item = Marshal.load(row[0])
 
       # Filter out campus IDs from Elements items, otherwise they'd cause mismatches
