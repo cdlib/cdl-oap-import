@@ -410,6 +410,12 @@ def groupItems()
         item.ids.reject! { |scheme, id| isCampusID(scheme) }
       end
 
+      # A couple items have invalid dates in February. Filter those out.
+      if item.date =~ /\d\d\d\d-02-3[01]$/
+        puts "Skipping item due to invalid date #{item.date.inspect}. Item: #{item}"
+        next
+      end
+
       # Keep track of any campus IDs remaining
       anyCampus ||= (item.campusIDs.length > 0)
       $titleCount[item.title] += 1
