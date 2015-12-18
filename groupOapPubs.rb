@@ -369,10 +369,8 @@ def checkValidUser(propID)
   req.basic_auth $apiCred[0], $apiCred[1]
   res = $elementsAPIConn.request(req)
   if res.is_a?(Net::HTTPSuccess)
-    puts "** User Valid: #{propID}"
     return true
   end
-  puts "** User Invalid: #{propID}"
   return false
 end
 
