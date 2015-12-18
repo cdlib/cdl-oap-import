@@ -765,7 +765,7 @@ def printPub(postNum, pub, oapID)
     puts "Post \##{postNum}:"
     pub.items.each { |item|
       idStr = item.ids.map { |kind, id| "#{kind}::#{id}" }.join(', ')
-      puts "  INFO: #{item.title} [#{item.typeName}]"
+      puts "  INFO: #{item.title.inspect} [#{item.typeName}]"
       puts "  INFO:     #{item.date ? item.date : '<no date>'}     #{item.authors.join('; ').gsub('|;', ';')}"
       puts "  INFO:     #{idStr}"
       item.suggestions and puts "  INFO:     Sugg: #{item.suggestions}"
