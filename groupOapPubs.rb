@@ -33,6 +33,7 @@ $forceMode = ARGV.delete('--force')
 $reportMode = ARGV.delete('--report')
 $testMode = ARGV.delete('--test')
 $onlyElem = ARGV.delete("--onlyElem")
+$onlyCache = ARGV.delete("--onlyCache")
 
 if ARGV.include? '--only'
   pos = ARGV.index '--only'
@@ -46,6 +47,7 @@ $titleCount = Hash.new{|h, k| h[k] = 0 }
 $authKeys = Hash.new{|h, k| h[k] = calcAuthorKeys(k) }
 $emailToElementsUser = Hash.new{|h, k| h[k] = lookupElementsEmail(k) }
 $usernameToElementsUser = Hash.new{|h, k| h[k] = lookupElementsUsername(k) }
+$isValidUser = Hash.new{|h, k| h[k] = checkValidUser(k) }
 $credentials = nil
 if $testMode
   puts "\n*** TEST MODE: No IDs will be minted, no actual posts will be made. ***\n"
@@ -360,33 +362,23 @@ def lookupElementsUsername(username)
 end
 
 ###################################################################################################
-# Temporary to faciliate switching from spaces in doc keys to no spaces (e.g. so that "U.S." and
-# "US" will end up equivalent)
-def removeSpacesFromDocKeys()
-  todo = []
-  db_execute("SELECT campus_id, doc_key FROM raw_items WHERE doc_key LIKE ?", "% %").each { |row|
-    todo << [row[0], row[1]]
-  }
-  todo.empty? and return
-
-  puts("Removing spaces from doc keys.")
-  db_execute("begin")
-  nDone = 0
-  todo.each { |campusID, oldDocKey|
-    (nDone % 10000) == 0 and puts "  Fixed #{nDone}/#{todo.length} doc keys."
-    nDone += 1
-    newDocKey = oldDocKey.gsub(' ', '')
-    db_execute("UPDATE raw_items SET doc_key = ? WHERE campus_id = ?", [newDocKey, campusID])
-  }
-  db_execute("commit")
-  puts "  Fixed #{nDone}/#{todo.length} doc keys."
+def checkValidUser(propID)
+  uri = URI("#{$elementsAPI}/users/pid-#{CGI.escape(propID)}")
+  req = Net::HTTP::Get.new(uri)
+  req['Content-Type'] = 'text/xml'
+  req.basic_auth $apiCred[0], $apiCred[1]
+  res = $elementsAPIConn.request(req)
+  if res.is_a?(Net::HTTPSuccess)
+    puts "** User Valid: #{propID}"
+    return true
+  end
+  puts "** User Invalid: #{propID}"
+  return false
 end
 
 ###################################################################################################
 # For items with a matching title key, group together by overlapping authors to form the OA Pubs.
 def groupItems()
-  # During transition, make sure doc keys don't have spaces in them.
-  removeSpacesFromDocKeys
 
   # Grab all the distinct doc keys
   allKeys = db_execute("SELECT DISTINCT doc_key FROM raw_items").map { |row| row[0] }
@@ -1087,6 +1079,15 @@ def importPub(postNum, pub, ids, bestItem, oapID)
     #puts "  Skip: Existing record is the same."
   else
     printed ||= printPub(postNum, pub, oapID)
+
+    # Make sure all the users have really been added in Elements
+    invalidIds = pub.userPropIds ? pub.userPropIds.to_a.reject{ |id| $isValidUser[id] } : []
+    if !invalidIds.empty?
+      puts "  Warning: skipping record due to not-yet-valid user(s): #{invalidIds.join(", ")}"
+      return
+    end
+
+    # Put the records and update the database with the info
     isJoinedRecord, isElemCompat, elemItem = putRecord(pub, oapID, toPut)
     db_execute('INSERT OR REPLACE INTO oap_flags (oap_id, isJoinedRecord, isElemCompat) VALUES (?, ?, ?)',
       [oapID, isJoinedRecord ? 1 : 0, isElemCompat ? 1 : 0])
@@ -1196,6 +1197,11 @@ def main
   ARGV.each { |filename|
     buildItemCache(filename)
   }
+
+  if $onlyCache
+    puts "Caches built, exiting early because of --onlyCache mode."
+    exit 0
+  end
 
   # Fire up threads for minting and importing
   Thread.abort_on_exception = true
