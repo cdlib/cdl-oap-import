@@ -3,10 +3,6 @@
 # This script groups publications together using title, author and identifiers.
 # The resulting de-duped "OA Publications" will be used for OAP identifier assignment and then pushing
 # into Symplectic Elements via the API.
-#
-# TODO: Associate these records, when we have an Elements ID, with the Elements item.
-#
-# The code is very much a work in progress.
 
 # System libraries
 require 'cgi'
