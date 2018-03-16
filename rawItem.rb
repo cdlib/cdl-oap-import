@@ -103,7 +103,7 @@ end
 def normalizeIdentifier(str)
   str or return ''
   tmp = str.downcase.strip
-  tmp = tmp.sub(/^https?:\/\/dx.doi.org\//, '').sub(/^(doi(\.org)?|pmid|pmcid):/, '').sub(/\.+$/, '')
+  tmp = tmp.sub(/^https?:\/\/(dx\.)?doi.org\//, '').sub(/^(doi(\.org)?|pmid|pmcid):/, '').sub(/\.+$/, '')
   tmp = tmp.sub(/^\[(.*)\]$/, '\1').sub(/^"(.*)"$/, '\1').sub(/^\[(.*)\]$/, '\1').sub(/^"(.*)"$/, '\1')
   return tmp
 end
